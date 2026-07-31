@@ -1,12 +1,16 @@
-"""Phase F: hand-labeling tool to produce TrackNet training data.
+"""Phase F: hand-labeling tool for producing additional TrackNet training data.
 
-This is the practical bridge for the "no labeled data yet" gap: step through
-a video frame by frame, click the ball's position, and dump the result to a
-CSV of (frame_index, x, y) that tennis_tracker.tracknet.BallHeatmapDataset
-consumes directly. There's no way around actually watching footage and
-marking the ball by hand — this just makes that as fast as possible (click,
-arrow key, click, arrow key) and checkpoints progress so a labeling session
-can be resumed later.
+tennis_tracker.tracknet now trains directly from the standard TrackNet
+dataset layout (game*/Clip*/*.jpg + Label.csv). This tool is for labeling
+*your own* footage beyond that dataset — e.g. fine-tuning on your specific
+camera/court/lighting. It dumps a CSV of (frame_index, x, y), which is a
+different (simpler) schema than Label.csv's (file name, visibility class,
+x, y, trajectory pattern) — to actually train on hand-labeled footage,
+extract its frames as individual images (tennis_tracker.ingestion.extract_frames)
+and reformat this tool's output into that schema first. There's no way
+around actually watching footage and marking the ball by hand — this just
+makes that as fast as possible (click, arrow key, click, arrow key) and
+checkpoints progress so a labeling session can be resumed later.
 
 The interactive loop needs a real display (cv2.imshow) and isn't something
 that can run headlessly in this sandbox — it's meant to be run locally. The
