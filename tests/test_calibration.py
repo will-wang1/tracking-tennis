@@ -2,7 +2,12 @@ import cv2
 import numpy as np
 import pytest
 
-from tennis_tracker.calibration import COURT_LANDMARKS, calibrate_camera
+from tennis_tracker.calibration import (
+    COURT_LANDMARKS,
+    calibrate_camera,
+    load_correspondences_json,
+    save_correspondences_json,
+)
 
 
 def _synthetic_correspondences(fx, fy, width, height, cam_pos, look_at, noise_std=0.0, rng=None):
@@ -82,3 +87,13 @@ def test_raises_with_unknown_landmark_name():
     correspondences = {f"bad_name_{i}": (i * 10.0, i * 10.0) for i in range(8)}
     with pytest.raises(ValueError, match="Unknown landmark"):
         calibrate_camera(correspondences, (1280, 720))
+
+
+def test_correspondences_json_round_trip(tmp_path):
+    correspondences = {"net_center_ground": (640.0, 360.0), "baseline_near_center_mark": (640.5, 599.25)}
+    path = tmp_path / "correspondences.json"
+
+    save_correspondences_json(correspondences, path)
+    loaded = load_correspondences_json(path)
+
+    assert loaded == correspondences

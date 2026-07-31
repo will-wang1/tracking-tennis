@@ -13,7 +13,9 @@ the length of the court (baseline direction), Z vertical (up).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -160,3 +162,112 @@ def calibrate_camera(
         translation_vector=best_tvec.reshape(3),
         reprojection_error_px=best_error,
     )
+
+
+def save_correspondences_json(correspondences: dict[str, tuple[float, float]], path: str | Path) -> None:
+    """Persist landmark-name -> pixel-position correspondences, e.g. from an interactive click session."""
+    with Path(path).open("w") as f:
+        json.dump({name: list(pixel) for name, pixel in correspondences.items()}, f, indent=2)
+
+
+def load_correspondences_json(path: str | Path) -> dict[str, tuple[float, float]]:
+    with Path(path).open() as f:
+        data = json.load(f)
+    return {name: tuple(pixel) for name, pixel in data.items()}
+
+
+def collect_correspondences_interactive(
+    reference_frame: np.ndarray, landmark_names: list[str] | None = None
+) -> dict[str, tuple[float, float]]:
+    """Click each named court landmark, one at a time, on a reference frame.
+
+    Requires a real display (cv2.imshow) — not runnable headlessly. Prompts
+    for each landmark in turn; left-click sets its pixel position, 's' skips
+    a landmark that isn't visible in this frame (occluded/out of shot), and
+    at least MIN_CALIBRATION_POINTS must be set for calibrate_camera to work.
+    """
+    import cv2 as _cv2  # local import: this function is display-only and untestable headlessly
+
+    names = landmark_names or list(COURT_LANDMARKS.keys())
+    correspondences: dict[str, tuple[float, float]] = {}
+    clicked = {"pos": None}
+
+    def on_mouse(event, x, y, flags, param):
+        if event == _cv2.EVENT_LBUTTONDOWN:
+            clicked["pos"] = (float(x), float(y))
+
+    window_name = "Court Calibration  (click landmark, s=skip, q=finish early)"
+    _cv2.namedWindow(window_name)
+    _cv2.setMouseCallback(window_name, on_mouse)
+
+    try:
+        for name in names:
+            clicked["pos"] = None
+            while clicked["pos"] is None:
+                frame = reference_frame.copy()
+                _cv2.putText(
+                    frame, f"Click: {name}  ({len(correspondences)} placed so far)",
+                    (10, 25), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                )
+                _cv2.imshow(window_name, frame)
+                key = _cv2.waitKey(20) & 0xFF
+                if key == ord("s"):
+                    break
+                if key == ord("q"):
+                    return correspondences
+            if clicked["pos"] is not None:
+                correspondences[name] = clicked["pos"]
+    finally:
+        _cv2.destroyAllWindows()
+
+    return correspondences
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Camera calibration from tennis court landmarks.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    collect_p = sub.add_parser("collect", help="Interactively click landmarks on a video frame (needs a display).")
+    collect_p.add_argument("video", help="Path to the source video file.")
+    collect_p.add_argument("output_json", help="Path to save the clicked correspondences to.")
+    collect_p.add_argument("--frame", type=int, default=0, help="Which frame to use as the reference frame.")
+
+    solve_p = sub.add_parser("solve", help="Solve calibration from a saved correspondences JSON and print it.")
+    solve_p.add_argument("correspondences_json", help="Path to a correspondences JSON from 'collect'.")
+    solve_p.add_argument("video", help="Source video, used only to read the frame size.")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "collect":
+        cap = cv2.VideoCapture(str(args.video))
+        for _ in range(args.frame + 1):
+            ok, frame = cap.read()
+            if not ok:
+                break
+        cap.release()
+        if not ok:
+            raise RuntimeError(f"Could not read frame {args.frame} from {args.video}")
+        correspondences = collect_correspondences_interactive(frame)
+        save_correspondences_json(correspondences, args.output_json)
+        print(f"Saved {len(correspondences)} correspondences to {args.output_json}")
+        return 0
+
+    if args.command == "solve":
+        cap = cv2.VideoCapture(str(args.video))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        correspondences = load_correspondences_json(args.correspondences_json)
+        calib = calibrate_camera(correspondences, (width, height))
+        print(f"fx={calib.fx:.2f} fy={calib.fy:.2f} cx={calib.cx:.2f} cy={calib.cy:.2f}")
+        print(f"camera position (world, m): {calib.camera_position_world()}")
+        print(f"reprojection error: {calib.reprojection_error_px:.3f} px")
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
