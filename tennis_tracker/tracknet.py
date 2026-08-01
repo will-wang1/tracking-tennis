@@ -301,28 +301,47 @@ def train(
     batch_size: int = 2,
     lr: float = 1e-3,
     device: str = "cpu",
+    progress_callback=None,
 ) -> list[float]:
-    """Trains ``model`` in place; returns the per-epoch mean loss history."""
+    """Trains ``model`` in place; returns the per-epoch mean loss history.
+
+    ``progress_callback``, if given, is called after every batch as
+    ``progress_callback(epoch, batch_index, num_batches, batch_loss)`` (all
+    1-indexed except epoch) — a full training run can have thousands of
+    batches, so this is what lets a CLI show live progress instead of a
+    blank terminal for however long the run takes.
+    """
     model.to(device)
     model.train()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.BCELoss()
+    num_batches = len(loader)
 
     history = []
-    for _ in range(epochs):
+    for epoch in range(epochs):
         epoch_losses = []
-        for frames, targets in loader:
+        for batch_index, (frames, targets) in enumerate(loader, start=1):
             frames, targets = frames.to(device), targets.to(device)
             optimizer.zero_grad()
             predictions = model(frames)
             loss = loss_fn(predictions, targets)
             loss.backward()
             optimizer.step()
-            epoch_losses.append(loss.item())
+            batch_loss = loss.item()
+            epoch_losses.append(batch_loss)
+            if progress_callback is not None:
+                progress_callback(epoch, batch_index, num_batches, batch_loss)
         history.append(float(np.mean(epoch_losses)))
 
     return history
+
+
+def print_training_progress(epoch: int, batch_index: int, num_batches: int, batch_loss: float) -> None:
+    """A ready-made progress_callback for train() that prints a live-updating progress line."""
+    print(f"\repoch {epoch + 1}  batch {batch_index}/{num_batches}  loss {batch_loss:.4f}", end="", flush=True)
+    if batch_index == num_batches:
+        print()
 
 
 def save_model(model: TrackNet, path: str | Path) -> None:
@@ -473,7 +492,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Training on {len(dataset)} windows from {args.dataset_root}")
         model = TrackNet(num_frames=args.num_frames)
         history = train(
-            model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device
+            model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
+            progress_callback=print_training_progress,
         )
         save_model(model, args.output)
         print(f"Saved model to {args.output}; final loss {history[-1]:.4f}")

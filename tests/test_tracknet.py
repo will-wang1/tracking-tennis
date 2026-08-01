@@ -149,6 +149,21 @@ def test_training_loop_reduces_loss_on_toy_dataset(tmp_path):
     assert history[-1] < history[0]
 
 
+def test_train_calls_progress_callback_once_per_batch(tmp_path):
+    _write_clip(tmp_path / "game1" / "Clip1", n_frames=10)
+    dataset = build_dataset_from_root(tmp_path, num_frames=3, input_size=(64, 48))
+    model = TrackNet(num_frames=3)
+
+    calls = []
+    train(model, dataset, epochs=2, batch_size=2, progress_callback=lambda *args: calls.append(args))
+
+    num_batches_per_epoch = -(-len(dataset) // 2)  # ceil division, matches DataLoader's last partial batch
+    assert len(calls) == 2 * num_batches_per_epoch
+    # 1-indexed batch numbers within each epoch, epoch itself 0-indexed.
+    assert calls[0][0] == 0 and calls[0][1] == 1
+    assert calls[-1][0] == 1 and calls[-1][1] == num_batches_per_epoch
+
+
 def test_save_and_load_model_round_trip(tmp_path):
     model = TrackNet(num_frames=3)
     path = tmp_path / "model.pt"
