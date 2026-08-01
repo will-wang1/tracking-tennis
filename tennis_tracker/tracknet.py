@@ -95,7 +95,11 @@ class TrackNet(nn.Module):
 
         self.output_conv = nn.Conv2d(64, num_frames, kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Raw pre-sigmoid output. Training uses this + BCEWithLogitsLoss, which is
+        numerically stable and autocast-safe, unlike computing sigmoid then BCELoss
+        separately (fp16 can round a sigmoid output infinitesimally outside [0, 1],
+        which CUDA's BCELoss kernel then rejects with a hard assertion failure)."""
         x = self.pool1(self.enc1(x))
         x = self.pool2(self.enc2(x))
         x = self.pool3(self.enc3(x))
@@ -103,7 +107,10 @@ class TrackNet(nn.Module):
         x = self.dec3(self.up3(x))
         x = self.dec2(self.up2(x))
         x = self.dec1(self.up1(x))
-        return torch.sigmoid(self.output_conv(x))
+        return self.output_conv(x)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.forward_logits(x))
 
 
 def generate_heatmap(x: float, y: float, height: int, width: int, sigma: float = DEFAULT_HEATMAP_SIGMA) -> np.ndarray:
@@ -303,6 +310,8 @@ def train(
     device: str = "cpu",
     num_workers: int = 0,
     use_amp: bool = True,
+    grad_clip_norm: float = 1.0,
+    checkpoint_path: str | Path | None = None,
     progress_callback=None,
 ) -> list[float]:
     """Trains ``model`` in place; returns the per-epoch mean loss history.
@@ -323,7 +332,16 @@ def train(
     ``use_amp`` enables mixed-precision training on CUDA (most of the compute
     happens in float16 instead of float32) — a genuine compute speedup on
     GPUs with Tensor Cores, not just a data-pipeline fix like the two above.
-    It's automatically a no-op on CPU regardless of this flag.
+    It's automatically a no-op on CPU regardless of this flag. Loss is
+    BCEWithLogitsLoss on the model's raw logits rather than sigmoid output +
+    BCELoss — the latter is both disallowed under autocast and can trip a
+    hard CUDA assertion if fp16 rounding pushes a sigmoid output outside
+    [0, 1]. ``grad_clip_norm`` bounds gradient norms as an extra guard
+    against the instability that error was a symptom of.
+
+    ``checkpoint_path``, if given, saves the model after every epoch (not
+    just at the end) — a crash partway through a long run then loses at most
+    one epoch's progress instead of all of it.
     """
     torch.backends.cudnn.benchmark = True
     device_type = "cuda" if str(device).startswith("cuda") else "cpu"
@@ -340,7 +358,7 @@ def train(
         persistent_workers=num_workers > 0,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.BCELoss()
+    loss_fn = nn.BCEWithLogitsLoss()
     scaler = torch.amp.GradScaler(device_type, enabled=amp_enabled)
     num_batches = len(loader)
 
@@ -352,12 +370,12 @@ def train(
             targets = targets.to(device, non_blocking=True)
             optimizer.zero_grad()
             with torch.amp.autocast(device_type, enabled=amp_enabled):
-                predictions = model(frames)
-            # BCELoss on post-sigmoid probabilities is numerically unstable
-            # (and disallowed by autocast) in fp16 — the heavy conv/pooling
-            # work above still runs in fp16, but the loss itself needs fp32.
-            loss = loss_fn(predictions.float(), targets)
+                logits = model.forward_logits(frames)
+                loss = loss_fn(logits, targets)
             scaler.scale(loss).backward()
+            if grad_clip_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             scaler.step(optimizer)
             scaler.update()
             batch_loss = loss.item()
@@ -365,6 +383,8 @@ def train(
             if progress_callback is not None:
                 progress_callback(epoch, batch_index, num_batches, batch_loss)
         history.append(float(np.mean(epoch_losses)))
+        if checkpoint_path is not None:
+            save_model(model, checkpoint_path)
 
     return history
 
@@ -543,10 +563,10 @@ def main(argv: list[str] | None = None) -> int:
         model = TrackNet(num_frames=args.num_frames)
         history = train(
             model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
-            num_workers=args.num_workers, use_amp=not args.no_amp, progress_callback=print_training_progress,
+            num_workers=args.num_workers, use_amp=not args.no_amp, checkpoint_path=args.output,
+            progress_callback=print_training_progress,
         )
-        save_model(model, args.output)
-        print(f"Saved model to {args.output}; final loss {history[-1]:.4f}")
+        print(f"Saved model to {args.output} (checkpointed every epoch); final loss {history[-1]:.4f}")
         return 0
 
     if args.command == "visualize":

@@ -65,6 +65,21 @@ def test_tracknet_forward_pass_shape():
     assert output.min() >= 0.0 and output.max() <= 1.0
 
 
+def test_forward_is_sigmoid_of_forward_logits():
+    model = TrackNet(num_frames=3)
+    model.eval()
+    x = torch.rand(1, 9, 64, 96)
+
+    with torch.no_grad():
+        logits = model.forward_logits(x)
+        probs = model(x)
+
+    # forward() must stay sigmoid(logits) so existing inference code (which
+    # treats the model's output as a [0,1] probability heatmap) is unaffected
+    # by training now using forward_logits() + BCEWithLogitsLoss internally.
+    torch.testing.assert_close(torch.sigmoid(logits), probs)
+
+
 def test_load_label_csv_standard_headers(tmp_path):
     clip_dir = tmp_path / "Clip1"
     _write_clip(clip_dir, n_frames=5)
@@ -147,6 +162,30 @@ def test_training_loop_reduces_loss_on_toy_dataset(tmp_path):
 
     assert len(history) == 8
     assert history[-1] < history[0]
+
+
+def test_train_checkpoints_after_every_epoch_not_just_at_the_end(tmp_path):
+    _write_clip(tmp_path / "game1" / "Clip1", n_frames=10)
+    dataset = build_dataset_from_root(tmp_path, num_frames=3, input_size=(64, 48))
+    model = TrackNet(num_frames=3)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    seen_checkpoint_before_epoch_2 = []
+
+    def progress_callback(epoch, batch_index, num_batches, batch_loss):
+        if epoch == 1 and batch_index == 1:
+            # Epoch 0 has fully finished by the time epoch 1 starts, so if
+            # checkpointing happens every epoch (not only after train()
+            # returns), the file must already exist here.
+            seen_checkpoint_before_epoch_2.append(checkpoint_path.exists())
+
+    train(
+        model, dataset, epochs=2, batch_size=2, checkpoint_path=checkpoint_path,
+        progress_callback=progress_callback,
+    )
+
+    assert seen_checkpoint_before_epoch_2 == [True]
+    assert load_model(checkpoint_path).num_frames == 3
 
 
 def test_train_calls_progress_callback_once_per_batch(tmp_path):
