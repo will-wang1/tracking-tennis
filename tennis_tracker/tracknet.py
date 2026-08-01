@@ -353,7 +353,10 @@ def train(
             optimizer.zero_grad()
             with torch.amp.autocast(device_type, enabled=amp_enabled):
                 predictions = model(frames)
-                loss = loss_fn(predictions, targets)
+            # BCELoss on post-sigmoid probabilities is numerically unstable
+            # (and disallowed by autocast) in fp16 — the heavy conv/pooling
+            # work above still runs in fp16, but the loss itself needs fp32.
+            loss = loss_fn(predictions.float(), targets)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
