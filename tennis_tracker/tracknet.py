@@ -301,6 +301,7 @@ def train(
     batch_size: int = 2,
     lr: float = 1e-3,
     device: str = "cpu",
+    num_workers: int = 0,
     progress_callback=None,
 ) -> list[float]:
     """Trains ``model`` in place; returns the per-epoch mean loss history.
@@ -310,10 +311,26 @@ def train(
     1-indexed except epoch) — a full training run can have thousands of
     batches, so this is what lets a CLI show live progress instead of a
     blank terminal for however long the run takes.
+
+    ``num_workers`` > 0 loads/decodes the next batch's images in background
+    worker processes while the GPU computes on the current batch, instead of
+    stalling on disk I/O between every batch. Every input in this dataset is
+    the same fixed size, so cuDNN's autotuner (enabled below) can pick the
+    fastest convolution algorithm for that shape once and reuse it — on CUDA
+    this is normally a large speedup for a fixed-input-size CNN like this one.
     """
+    torch.backends.cudnn.benchmark = True
+
     model.to(device)
     model.train()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=str(device).startswith("cuda"),
+        persistent_workers=num_workers > 0,
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.BCELoss()
     num_batches = len(loader)
@@ -475,6 +492,10 @@ def main(argv: list[str] | None = None) -> int:
     train_p.add_argument("--batch-size", type=int, default=2)
     train_p.add_argument("--lr", type=float, default=1e-3)
     train_p.add_argument("--device", default="cpu")
+    train_p.add_argument(
+        "--num-workers", type=int, default=4,
+        help="Background processes for loading/decoding images in parallel with GPU compute. 0 disables.",
+    )
 
     viz_p = sub.add_parser("visualize", help="Run a trained model over a video, drawing the detected ball trail.")
     viz_p.add_argument("video")
@@ -493,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
         model = TrackNet(num_frames=args.num_frames)
         history = train(
             model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
-            progress_callback=print_training_progress,
+            num_workers=args.num_workers, progress_callback=print_training_progress,
         )
         save_model(model, args.output)
         print(f"Saved model to {args.output}; final loss {history[-1]:.4f}")
