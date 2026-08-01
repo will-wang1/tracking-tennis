@@ -302,6 +302,7 @@ def train(
     lr: float = 1e-3,
     device: str = "cpu",
     num_workers: int = 0,
+    use_amp: bool = True,
     progress_callback=None,
 ) -> list[float]:
     """Trains ``model`` in place; returns the per-epoch mean loss history.
@@ -318,8 +319,15 @@ def train(
     the same fixed size, so cuDNN's autotuner (enabled below) can pick the
     fastest convolution algorithm for that shape once and reuse it — on CUDA
     this is normally a large speedup for a fixed-input-size CNN like this one.
+
+    ``use_amp`` enables mixed-precision training on CUDA (most of the compute
+    happens in float16 instead of float32) — a genuine compute speedup on
+    GPUs with Tensor Cores, not just a data-pipeline fix like the two above.
+    It's automatically a no-op on CPU regardless of this flag.
     """
     torch.backends.cudnn.benchmark = True
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    amp_enabled = use_amp and device_type == "cuda" and torch.cuda.is_available()
 
     model.to(device)
     model.train()
@@ -328,23 +336,27 @@ def train(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=str(device).startswith("cuda"),
+        pin_memory=device_type == "cuda",
         persistent_workers=num_workers > 0,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.BCELoss()
+    scaler = torch.amp.GradScaler(device_type, enabled=amp_enabled)
     num_batches = len(loader)
 
     history = []
     for epoch in range(epochs):
         epoch_losses = []
         for batch_index, (frames, targets) in enumerate(loader, start=1):
-            frames, targets = frames.to(device), targets.to(device)
+            frames = frames.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             optimizer.zero_grad()
-            predictions = model(frames)
-            loss = loss_fn(predictions, targets)
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast(device_type, enabled=amp_enabled):
+                predictions = model(frames)
+                loss = loss_fn(predictions, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             batch_loss = loss.item()
             epoch_losses.append(batch_loss)
             if progress_callback is not None:
@@ -496,6 +508,18 @@ def main(argv: list[str] | None = None) -> int:
         "--num-workers", type=int, default=4,
         help="Background processes for loading/decoding images in parallel with GPU compute. 0 disables.",
     )
+    train_p.add_argument(
+        "--input-width", type=int, default=DEFAULT_INPUT_SIZE[0],
+        help="Resize frames to this width before feeding the network. Smaller = faster, less precise.",
+    )
+    train_p.add_argument(
+        "--input-height", type=int, default=DEFAULT_INPUT_SIZE[1],
+        help="Resize frames to this height before feeding the network. Smaller = faster, less precise.",
+    )
+    train_p.add_argument(
+        "--no-amp", action="store_true",
+        help="Disable mixed-precision (fp16) training. On by default on CUDA; harmless to leave on.",
+    )
 
     viz_p = sub.add_parser("visualize", help="Run a trained model over a video, drawing the detected ball trail.")
     viz_p.add_argument("video")
@@ -507,14 +531,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "train":
         games = [int(g) for g in args.games.split(",")] if args.games else None
+        input_size = (args.input_width, args.input_height)
         dataset = build_dataset_from_root(
-            args.dataset_root, games=games, max_clips_per_game=args.max_clips_per_game, num_frames=args.num_frames
+            args.dataset_root, games=games, max_clips_per_game=args.max_clips_per_game,
+            num_frames=args.num_frames, input_size=input_size,
         )
-        print(f"Training on {len(dataset)} windows from {args.dataset_root}")
+        print(f"Training on {len(dataset)} windows from {args.dataset_root} at {input_size[0]}x{input_size[1]}")
         model = TrackNet(num_frames=args.num_frames)
         history = train(
             model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
-            num_workers=args.num_workers, progress_callback=print_training_progress,
+            num_workers=args.num_workers, use_amp=not args.no_amp, progress_callback=print_training_progress,
         )
         save_model(model, args.output)
         print(f"Saved model to {args.output}; final loss {history[-1]:.4f}")
