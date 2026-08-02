@@ -5,3 +5,6 @@ __pycache__/
 *.egg-info/
 frames_out/
 models/
+*.pt
+*.pth
+train_log.txt
