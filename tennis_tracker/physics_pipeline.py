@@ -21,12 +21,12 @@ from pathlib import Path
 
 import cv2
 
-from tennis_tracker.ball import BallDetection, detect_video
+from tennis_tracker.ball import BallDetection
 from tennis_tracker.calibration import CameraCalibration, calibrate_camera, load_correspondences_json
 from tennis_tracker.classify import Handedness, classify_pose, nearest_player
 from tennis_tracker.contact_fit import ContactEvent, fit_contact_event
 from tennis_tracker.physics import TennisBallParams
-from tennis_tracker.pipeline import parse_handedness_arg
+from tennis_tracker.pipeline import get_ball_detections, parse_handedness_arg
 from tennis_tracker.pose import track_poses
 from tennis_tracker.trajectory import HitEvent, detect_hits, smooth_trajectory
 
@@ -87,9 +87,10 @@ def run_physics_pipeline(
     gap: int = DEFAULT_GAP,
     min_observations: int = DEFAULT_MIN_OBSERVATIONS,
     gap_warning_m: float = DEFAULT_GAP_WARNING_M,
+    detector: str = "classical",
+    tracknet_model_path: str | Path | None = None,
+    tracknet_device: str = "cpu",
 ) -> list[PhysicsShotResult]:
-    ball_detector_kwargs = ball_detector_kwargs or {}
-
     frame_poses_list = list(track_poses(video_path, max_players=max_players))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
@@ -97,7 +98,10 @@ def run_physics_pipeline(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
 
-    detections = list(detect_video(video_path, **ball_detector_kwargs))
+    detections = get_ball_detections(
+        video_path, detector=detector, ball_detector_kwargs=ball_detector_kwargs,
+        tracknet_model_path=tracknet_model_path, tracknet_device=tracknet_device,
+    )
     tracked = smooth_trajectory(detections, fps=fps)
     hits = detect_hits(tracked)
 
@@ -186,6 +190,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-log", required=True, help="Path to write the shot log to (.json or .csv).")
     parser.add_argument("--handedness", default="", help='e.g. "0:right,1:left". Defaults to right.')
     parser.add_argument("--max-players", type=int, default=2)
+    parser.add_argument(
+        "--detector", choices=["classical", "tracknet"], default="classical",
+        help='Ball detector to use. "tracknet" requires --tracknet-model.',
+    )
+    parser.add_argument("--tracknet-model", default=None, help="Trained TrackNet checkpoint (from tracknet.py train).")
+    parser.add_argument("--tracknet-device", default="cpu", help='"cpu" or "cuda", for the tracknet detector.')
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -199,7 +209,10 @@ def main(argv: list[str] | None = None) -> int:
     calibration = calibrate_camera(correspondences, (width, height))
     print(f"Calibration reprojection error: {calibration.reprojection_error_px:.2f} px")
 
-    results = run_physics_pipeline(args.video, calibration, handedness, max_players=args.max_players)
+    results = run_physics_pipeline(
+        args.video, calibration, handedness, max_players=args.max_players,
+        detector=args.detector, tracknet_model_path=args.tracknet_model, tracknet_device=args.tracknet_device,
+    )
     write_physics_shot_log(results, args.output_log)
 
     for r in results:

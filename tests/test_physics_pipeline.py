@@ -149,3 +149,36 @@ def test_end_to_end_recovers_contact_time_and_speed_order_of_magnitude(tmp_path)
     # recovers the right physical ballpark, not pixel-perfect precision.
     assert event.incoming_speed * 3.6 == pytest.approx(true_incoming_speed_kmh, rel=0.3)
     assert event.outgoing_speed * 3.6 == pytest.approx(true_outgoing_speed_kmh, rel=0.5)
+
+
+def test_run_physics_pipeline_threads_detector_choice_through(tmp_path, monkeypatch):
+    """Pose tracking (mediapipe) is stubbed out here — this test is only checking
+    that run_physics_pipeline passes its detector/model/device args through to
+    get_ball_detections correctly, not re-verifying detection or pose tracking
+    themselves (both already covered elsewhere)."""
+    from tennis_tracker import physics_pipeline as pp
+
+    monkeypatch.setattr(pp, "track_poses", lambda *a, **kw: iter([]))
+    captured = {}
+
+    def fake_get_ball_detections(video_path, detector="classical", ball_detector_kwargs=None,
+                                  tracknet_model_path=None, tracknet_device="cpu"):
+        captured.update(
+            detector=detector, tracknet_model_path=tracknet_model_path, tracknet_device=tracknet_device
+        )
+        return []
+
+    monkeypatch.setattr(pp, "get_ball_detections", fake_get_ball_detections)
+
+    video_path = tmp_path / "clip.mp4"
+    out = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 48))
+    out.write(np.zeros((48, 64, 3), dtype=np.uint8))
+    out.release()
+
+    calib = _synthetic_calibration(64, 48)
+    results = pp.run_physics_pipeline(
+        video_path, calib, {}, detector="tracknet", tracknet_model_path="model.pt", tracknet_device="cuda"
+    )
+
+    assert results == []
+    assert captured == {"detector": "tracknet", "tracknet_model_path": "model.pt", "tracknet_device": "cuda"}
