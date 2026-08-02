@@ -484,6 +484,7 @@ def visualize(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -509,9 +510,13 @@ def visualize(
                 cv2.line(frame, p1, p2, (0, 165, 255), 2)
             writer.write(frame)
             frame_count += 1
+            if frame_count % 10 == 0 or frame_count == total_frames:
+                print(f"\rframe {frame_count}/{total_frames or '?'}", end="", flush=True)
     finally:
         cap.release()
         writer.release()
+        if frame_count:
+            print()  # newline after the live-updating progress line
 
     return frame_count
 
