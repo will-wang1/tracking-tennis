@@ -1,0 +1,10 @@
+{
+  "name": "tracking-tennis",
+  "image": "mcr.microsoft.com/devcontainers/python:1-3.11-bullseye",
+  "postCreateCommand": "python3 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -r requirements.txt",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python"]
+    }
+  }
+}
