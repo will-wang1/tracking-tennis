@@ -43,7 +43,7 @@ def test_write_shot_log_json(tmp_path):
 
     data = json.loads(out_path.read_text())
 
-    assert data["summary"] == {"forehand": 1, "backhand": 1, "unclear": 0}
+    assert data["summary"] == {"forehand": 1, "backhand": 1, "unclear": 0, "no_pose_data": 0}
     assert len(data["shots"]) == 2
     assert data["shots"][0]["shot_type"] == "forehand"
     assert data["shots"][0]["frame_index"] == 10

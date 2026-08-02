@@ -10,9 +10,17 @@ frames, so this module adds a small nearest-centroid tracker on top to keep
 from __future__ import annotations
 
 import argparse
+import os
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Must be set before the first mediapipe import below: silences the
+# "Created TensorFlow Lite XNNPACK delegate", "Feedback manager requires...",
+# and "Using NORM_RECT without IMAGE_DIMENSIONS" lines mediapipe/TFLite/absl
+# print on every run — all benign and non-actionable, not actual errors.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "2")
 
 import cv2
 import numpy as np

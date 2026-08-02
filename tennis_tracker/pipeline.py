@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2
 
 from tennis_tracker.ball import BallDetection, detect_video
-from tennis_tracker.classify import Handedness, ShotClassification, classify_hits
+from tennis_tracker.classify import NO_POSE_DATA, Handedness, ShotClassification, classify_hits
 from tennis_tracker.pose import FramePoses, draw_pose_overlay, track_poses
 from tennis_tracker.trajectory import HitEvent, detect_hits, smooth_trajectory
 
@@ -21,7 +21,9 @@ from tennis_tracker.trajectory import HitEvent, detect_hits, smooth_trajectory
 # so it's readable rather than flashing for a single frame.
 LABEL_PERSIST_FRAMES = 15
 
-_LABEL_COLORS = {"forehand": (0, 255, 0), "backhand": (0, 0, 255), "unclear": (0, 255, 255)}
+_LABEL_COLORS = {
+    "forehand": (0, 255, 0), "backhand": (0, 0, 255), "unclear": (0, 255, 255), NO_POSE_DATA: (128, 128, 128),
+}
 
 
 def parse_handedness_arg(value: str | None) -> dict[int, Handedness]:
@@ -104,7 +106,7 @@ def write_shot_log(classifications: list[ShotClassification], output_path: str |
         }
         for c in classifications
     ]
-    counts = {"forehand": 0, "backhand": 0, "unclear": 0}
+    counts = {"forehand": 0, "backhand": 0, "unclear": 0, NO_POSE_DATA: 0}
     for row in rows:
         counts[row["shot_type"]] += 1
 
@@ -233,12 +235,17 @@ def main(argv: list[str] | None = None) -> int:
         args.video, args.output_video, frame_poses_list, detections, classifications
     )
 
-    counts = {"forehand": 0, "backhand": 0, "unclear": 0}
+    counts = {"forehand": 0, "backhand": 0, "unclear": 0, NO_POSE_DATA: 0}
     for c in classifications:
         counts[c.shot_type] += 1
 
     print(f"Processed {frame_count} frames, detected {len(hits)} hit(s).")
     print(f"Shots: {counts['forehand']} forehand, {counts['backhand']} backhand, {counts['unclear']} unclear.")
+    if counts[NO_POSE_DATA]:
+        print(
+            f"({counts[NO_POSE_DATA]} hit(s) could not be classified — no player pose found nearby, "
+            "e.g. occluded or briefly out of frame during the swing)"
+        )
     print(f"Annotated video: {args.output_video}")
     print(f"Shot log: {args.output_log}")
     return 0

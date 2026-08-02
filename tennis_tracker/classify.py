@@ -36,12 +36,15 @@ DEFAULT_SIDE_THRESHOLD = 0.15
 Handedness = str  # "right" or "left"
 
 
+NO_POSE_DATA = "no_pose_data"  # distinct from "unclear": no player/pose was found near the hit at all
+
+
 @dataclass
 class ShotClassification:
     hit: HitEvent
-    player_id: int
-    shot_type: str  # "forehand", "backhand", or "unclear"
-    confidence: float  # signed projection normalized by shoulder width; magnitude ~ decisiveness
+    player_id: int | None  # None when shot_type == NO_POSE_DATA
+    shot_type: str  # "forehand", "backhand", "unclear", or NO_POSE_DATA
+    confidence: float  # signed projection normalized by shoulder width; 0.0 when shot_type == NO_POSE_DATA
 
 
 def nearest_player(position: tuple[float, float], frame_poses: FramePoses) -> PlayerPose | None:
@@ -98,16 +101,22 @@ def classify_hits(
     handedness: dict[int, Handedness],
     max_frame_offset: int = 5,
 ) -> list[ShotClassification]:
-    """Classify each hit event using the nearest player's pose at (or near) that frame."""
+    """Classify each hit event using the nearest player's pose at (or near) that frame.
+
+    Always returns exactly one ShotClassification per hit — a hit with no
+    player/pose found nearby (occlusion, briefly out of frame, often right
+    at the moment of a fast swing) is reported as NO_POSE_DATA rather than
+    silently dropped, so "N hits detected" and the classified-shot counts
+    stay reconcilable instead of quietly disagreeing.
+    """
     results: list[ShotClassification] = []
 
     for hit in hits:
         frame_poses = _find_nearby_frame_poses(poses_by_frame, hit.frame_index, max_frame_offset)
-        if frame_poses is None:
-            continue
+        player = nearest_player(hit.position, frame_poses) if frame_poses is not None else None
 
-        player = nearest_player(hit.position, frame_poses)
         if player is None:
+            results.append(ShotClassification(hit=hit, player_id=None, shot_type=NO_POSE_DATA, confidence=0.0))
             continue
 
         player_handedness = handedness.get(player.player_id, "right")

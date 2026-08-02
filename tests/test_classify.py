@@ -1,6 +1,6 @@
 import numpy as np
 
-from tennis_tracker.classify import classify_hits, classify_pose, nearest_player
+from tennis_tracker.classify import NO_POSE_DATA, classify_hits, classify_pose, nearest_player
 from tennis_tracker.pose import (
     FramePoses,
     LEFT_HIP,
@@ -107,3 +107,36 @@ def test_classify_hits_end_to_end():
     assert len(results) == 1
     assert results[0].shot_type == "forehand"
     assert results[0].player_id == 0
+
+
+def test_classify_hits_reports_no_pose_data_instead_of_dropping_the_hit():
+    # No pose data anywhere near frame 10 (empty poses_by_frame) — this hit
+    # must still show up in the results, just marked as unclassifiable,
+    # rather than silently vanishing from the count.
+    hit = HitEvent(frame_index=10, timestamp=10 / 30, position=(100.0, 100.0), residual=20.0)
+
+    results = classify_hits([hit], {}, handedness={0: "right"})
+
+    assert len(results) == 1
+    assert results[0].shot_type == NO_POSE_DATA
+    assert results[0].player_id is None
+
+
+def test_classify_hits_keeps_one_result_per_hit_even_with_mixed_outcomes():
+    forehand_pose = _make_pose(
+        0, LEFT_SHOULDER_PX, RIGHT_SHOULDER_PX, LEFT_HIP_PX, RIGHT_HIP_PX,
+        left_wrist=(60, 110), right_wrist=(190, 90),
+    )
+    frame_poses = FramePoses(frame_index=10, timestamp=10 / 30, players=[forehand_pose])
+    hits = [
+        HitEvent(frame_index=10, timestamp=10 / 30, position=(100.0, 100.0), residual=20.0),
+        HitEvent(frame_index=200, timestamp=200 / 30, position=(300.0, 300.0), residual=15.0),
+        HitEvent(frame_index=400, timestamp=400 / 30, position=(50.0, 50.0), residual=18.0),
+    ]
+
+    results = classify_hits(hits, {10: frame_poses}, handedness={0: "right"})
+
+    # len(hits) == len(results) must always hold: "N hits detected" and the
+    # classified-shot counts should never disagree.
+    assert len(results) == len(hits)
+    assert [r.shot_type for r in results] == ["forehand", NO_POSE_DATA, NO_POSE_DATA]
