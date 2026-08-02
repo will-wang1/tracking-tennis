@@ -475,6 +475,7 @@ def visualize(
     model: TrackNet,
     trail_length: int = 15,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    device: str = "cpu",
 ) -> int:
     """Write an annotated copy of ``video_path`` with the TrackNet-detected ball + trail overlaid."""
     cap = cv2.VideoCapture(str(video_path))
@@ -492,7 +493,9 @@ def visualize(
     cap = cv2.VideoCapture(str(video_path))
     frame_count = 0
     try:
-        for detection in run_tracknet_on_video(video_path, model, confidence_threshold=confidence_threshold):
+        for detection in run_tracknet_on_video(
+            video_path, model, confidence_threshold=confidence_threshold, device=device
+        ):
             ok, frame = cap.read()
             if not ok:
                 break
@@ -549,6 +552,7 @@ def main(argv: list[str] | None = None) -> int:
     viz_p.add_argument("output_video")
     viz_p.add_argument("--model", required=True, help="Trained model checkpoint from 'train'.")
     viz_p.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
+    viz_p.add_argument("--device", default="cpu", help='"cpu" or "cuda" — GPU inference is much faster.')
 
     args = parser.parse_args(argv)
 
@@ -570,8 +574,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "visualize":
-        model = load_model(args.model)
-        count = visualize(args.video, args.output_video, model, confidence_threshold=args.confidence_threshold)
+        model = load_model(args.model, device=args.device)
+        count = visualize(
+            args.video, args.output_video, model,
+            confidence_threshold=args.confidence_threshold, device=args.device,
+        )
         print(f"Wrote {count} annotated frames to {args.output_video}")
         return 0
 
