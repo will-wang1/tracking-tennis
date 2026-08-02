@@ -1,7 +1,14 @@
 import numpy as np
 import pytest
 
-from tennis_tracker.pose import PlayerTracker, ensure_model
+from tennis_tracker.pose import (
+    FramePoses,
+    PlayerPose,
+    PlayerTracker,
+    _filter_to_most_active_tracks,
+    draw_pose_overlay,
+    ensure_model,
+)
 
 
 def _fake_detection(center_x, center_y, size=20.0):
@@ -102,3 +109,88 @@ def test_ensure_model_reuses_cached_file_without_redownloading(tmp_path, monkeyp
 
     assert result == fake_path
     assert result.read_bytes() == b"fake model bytes"
+
+
+def _make_frame_poses(frame_index, tracks: dict):
+    """``tracks`` maps player_id -> (x, y) centroid for this one frame."""
+    players = []
+    for player_id, (x, y) in tracks.items():
+        landmarks, visibility, bbox = _fake_detection(x, y)
+        players.append(PlayerPose(player_id, landmarks, visibility, bbox))
+    return FramePoses(frame_index=frame_index, timestamp=frame_index / 30, players=players)
+
+
+def test_filter_to_most_active_tracks_drops_stationary_bystander():
+    # Tracks 0 and 1 move substantially (real players); track 2 never
+    # moves (e.g. a ball kid or umpire standing still) and must be dropped.
+    frame_poses_list = [
+        _make_frame_poses(i, {0: (100 + i * 20, 200), 1: (900 - i * 20, 200), 2: (500, 500)})
+        for i in range(20)
+    ]
+
+    filtered = _filter_to_most_active_tracks(frame_poses_list, max_players=2)
+
+    all_ids = {p.player_id for fp in filtered for p in fp.players}
+    assert all_ids == {0, 1}
+    assert len(filtered) == 20
+    assert all(len(fp.players) == 2 for fp in filtered)
+
+
+def test_filter_to_most_active_tracks_remaps_ids_sequentially():
+    # The two movers have non-trivial original track IDs (5, 7); a
+    # stationary bystander has ID 2 in between them and must still be
+    # excluded, with the survivors remapped to 0/1.
+    frame_poses_list = [
+        _make_frame_poses(i, {5: (100 + i * 30, 200), 7: (900 - i * 30, 200), 2: (400, 400)})
+        for i in range(10)
+    ]
+
+    filtered = _filter_to_most_active_tracks(frame_poses_list, max_players=2)
+
+    all_ids = {p.player_id for fp in filtered for p in fp.players}
+    assert all_ids == {0, 1}
+
+
+def test_filter_to_most_active_tracks_ignores_briefly_seen_track():
+    # A track seen for only one frame contributes zero movement and should
+    # lose out to tracks with a real, sustained movement history.
+    frame_poses_list = [
+        _make_frame_poses(i, {0: (100 + i * 20, 200), 1: (900 - i * 20, 200)})
+        for i in range(20)
+    ]
+    frame_poses_list[0].players.append(PlayerPose(99, *_fake_detection(500, 500)))
+
+    filtered = _filter_to_most_active_tracks(frame_poses_list, max_players=2)
+
+    all_ids = {p.player_id for fp in filtered for p in fp.players}
+    assert 99 not in all_ids
+    assert all_ids == {0, 1}
+
+
+def test_draw_pose_overlay_skips_low_visibility_landmarks():
+    # Index 16 of _fake_detection's landmarks sits at the exact centroid
+    # (linspace(-size, size, 33) crosses zero at its middle element),
+    # comfortably inside the bbox interior so it can't collide with the
+    # bbox rectangle or label text drawn regardless of visibility.
+    landmarks, visibility, bbox = _fake_detection(100, 100)
+    center_x, center_y = int(landmarks[16, 0]), int(landmarks[16, 1])
+
+    low_visibility = visibility * 0.1  # below the default 0.5 threshold
+    frame_poses = FramePoses(0, 0.0, [PlayerPose(0, landmarks, low_visibility, bbox)])
+    blank = np.zeros((200, 200, 3), dtype=np.uint8)
+
+    annotated = draw_pose_overlay(blank, frame_poses)
+
+    assert tuple(annotated[center_y, center_x]) == (0, 0, 0)
+
+
+def test_draw_pose_overlay_draws_high_visibility_landmarks():
+    landmarks, visibility, bbox = _fake_detection(100, 100)
+    center_x, center_y = int(landmarks[16, 0]), int(landmarks[16, 1])
+
+    frame_poses = FramePoses(0, 0.0, [PlayerPose(0, landmarks, visibility, bbox)])
+    blank = np.zeros((200, 200, 3), dtype=np.uint8)
+
+    annotated = draw_pose_overlay(blank, frame_poses)
+
+    assert tuple(annotated[center_y, center_x]) != (0, 0, 0)

@@ -17,6 +17,7 @@ import numpy as np
 from tennis_tracker.ball import BallDetection, detect_video
 from tennis_tracker.classify import NO_POSE_DATA, Handedness, ShotClassification, classify_hits
 from tennis_tracker.pose import (
+    DEFAULT_MIN_LANDMARK_VISIBILITY,
     DEFAULT_POSE_MODEL_VARIANT,
     POSE_MODEL_VARIANTS,
     FramePoses,
@@ -120,12 +121,13 @@ def run_pipeline(
     max_ball_gap_sec: float = DEFAULT_MAX_BALL_GAP_SEC,
     pose_model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
     pose_confidence: float = 0.5,
+    over_detect_poses: int | None = None,
 ) -> PipelineResult:
     """Run pose tracking, ball tracking, hit detection, and classification over a video."""
     frame_poses_list = list(track_poses(
         video_path, max_players=max_players, model_variant=pose_model_variant,
         min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
-        min_tracking_confidence=pose_confidence,
+        min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
     ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
@@ -179,6 +181,7 @@ def render_annotated_video(
     tracked: list[TrackedPoint],
     classifications: list[ShotClassification],
     end_frame: int | None = None,
+    min_landmark_visibility: float = DEFAULT_MIN_LANDMARK_VISIBILITY,
 ) -> int:
     """Draws pose skeletons, the ball trail + speed, and shot labels onto a copy of the video.
 
@@ -244,7 +247,10 @@ def render_annotated_video(
 
             if frame_index in poses_by_frame:
                 labels = player_labels_by_frame.get(frame_index, {})
-                frame = draw_pose_overlay(frame, poses_by_frame[frame_index], player_labels=labels)
+                frame = draw_pose_overlay(
+                    frame, poses_by_frame[frame_index], player_labels=labels,
+                    min_landmark_visibility=min_landmark_visibility,
+                )
 
             writer.write(frame)
             frame_index += 1
@@ -290,6 +296,15 @@ def main(argv: list[str] | None = None) -> int:
         "--pose-confidence", type=float, default=0.5,
         help="Lower (e.g. 0.3) if players are going undetected during real play; raises false positives as a tradeoff.",
     )
+    parser.add_argument(
+        "--over-detect-poses", type=int, default=None,
+        help="Candidates tracked per frame before filtering to --max-players (default: max(6, max_players*3)). "
+        "Raise this if the wrong people (ball kids, umpire) are being picked as players.",
+    )
+    parser.add_argument(
+        "--min-landmark-visibility", type=float, default=DEFAULT_MIN_LANDMARK_VISIBILITY,
+        help="Skip drawing skeleton points/lines mediapipe is less than this confident it actually saw.",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -303,13 +318,14 @@ def main(argv: list[str] | None = None) -> int:
         args.video, handedness, max_players=args.max_players, ball_detector_kwargs=ball_detector_kwargs,
         detector=args.detector, tracknet_model_path=args.tracknet_model, tracknet_device=args.tracknet_device,
         max_ball_gap_sec=args.max_ball_gap_sec, pose_model_variant=args.pose_model_variant,
-        pose_confidence=args.pose_confidence,
+        pose_confidence=args.pose_confidence, over_detect_poses=args.over_detect_poses,
     )
 
     write_shot_log(result.classifications, args.output_log)
     frame_count = render_annotated_video(
         args.video, args.output_video, result.frame_poses, result.detections, result.tracked,
         result.classifications, end_frame=result.point_end_frame,
+        min_landmark_visibility=args.min_landmark_visibility,
     )
 
     counts = {"forehand": 0, "backhand": 0, "unclear": 0, NO_POSE_DATA: 0}

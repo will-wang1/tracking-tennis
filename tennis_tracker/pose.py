@@ -214,6 +214,45 @@ def _landmarks_to_pixels(pose_landmarks, width: int, height: int) -> tuple[np.nd
     return pts, visibility, bbox
 
 
+def _filter_to_most_active_tracks(frame_poses_list: list[FramePoses], max_players: int) -> list[FramePoses]:
+    """Keep only the ``max_players`` tracks with the most total movement, remapped to sequential IDs.
+
+    Real footage usually has more humans in frame than just the players —
+    ball kids, umpire, linespeople — who a detector capped at exactly
+    ``max_players`` has no way to distinguish from the players themselves;
+    it just keeps whichever candidates it's most confident about each
+    frame, which can inconsistently jump between different people frame to
+    frame. Over-detecting more candidates than needed and then keeping only
+    the ones that moved the most across the whole clip is a much more
+    reliable signal: real players move substantially during play, while
+    officials and ball kids mostly don't.
+    """
+    positions_by_track: dict[int, list[np.ndarray]] = {}
+    for frame_poses in frame_poses_list:
+        for player in frame_poses.players:
+            positions_by_track.setdefault(player.player_id, []).append(_centroid(player.landmarks_px))
+
+    def total_movement(track_id: int) -> float:
+        positions = np.array(positions_by_track[track_id])
+        if len(positions) < 2:
+            return 0.0
+        return float(np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)))
+
+    selected_track_ids = sorted(positions_by_track, key=total_movement, reverse=True)[:max_players]
+    id_remap = {track_id: new_id for new_id, track_id in enumerate(sorted(selected_track_ids))}
+
+    filtered: list[FramePoses] = []
+    for frame_poses in frame_poses_list:
+        players = [
+            PlayerPose(id_remap[p.player_id], p.landmarks_px, p.visibility, p.bbox)
+            for p in frame_poses.players
+            if p.player_id in id_remap
+        ]
+        players.sort(key=lambda p: p.player_id)
+        filtered.append(FramePoses(frame_index=frame_poses.frame_index, timestamp=frame_poses.timestamp, players=players))
+    return filtered
+
+
 def track_poses(
     video_path: str | Path,
     max_players: int = 2,
@@ -222,6 +261,7 @@ def track_poses(
     min_pose_presence_confidence: float = 0.5,
     min_tracking_confidence: float = 0.5,
     model_path: Path | None = None,
+    over_detect_poses: int | None = None,
 ):
     """Yield a FramePoses per video frame, with player IDs stable across frames.
 
@@ -232,14 +272,22 @@ def track_poses(
     accurate, and struggles most with players who are small/distant in
     frame, which is normal for a broadcast-angle tennis shot) and lowering
     the confidence thresholds below their conservative 0.5 defaults.
+
+    If instead detection is finding people but the *wrong* ones (ball kids,
+    umpire, linespeople), raise ``over_detect_poses`` (default:
+    ``max(6, max_players * 3)``) — more candidates are tracked internally
+    per frame, and only the ``max_players`` tracks that moved the most
+    across the whole clip are kept and returned as the players.
     """
+    over_detect_poses = over_detect_poses or max(6, max_players * 3)
+
     path = Path(video_path)
     resolved_model_path = ensure_model(model_variant, model_path)
 
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(resolved_model_path)),
         running_mode=VisionTaskRunningMode.VIDEO,
-        num_poses=max_players,
+        num_poses=over_detect_poses,
         min_pose_detection_confidence=min_pose_detection_confidence,
         min_pose_presence_confidence=min_pose_presence_confidence,
         min_tracking_confidence=min_tracking_confidence,
@@ -250,8 +298,11 @@ def track_poses(
         raise RuntimeError(f"Could not open video: {path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    tracker = PlayerTracker(max_players=max_players, max_match_distance=cap.get(cv2.CAP_PROP_FRAME_WIDTH) * MAX_MATCH_DISTANCE_FRAC)
+    tracker = PlayerTracker(
+        max_players=over_detect_poses, max_match_distance=cap.get(cv2.CAP_PROP_FRAME_WIDTH) * MAX_MATCH_DISTANCE_FRAC
+    )
 
+    raw_frames: list[FramePoses] = []
     try:
         with _suppress_native_stderr():
             landmarker = PoseLandmarker.create_from_options(options)
@@ -276,35 +327,55 @@ def track_poses(
                 ]
                 players = tracker.update(detections)
 
-                yield FramePoses(frame_index=frame_index, timestamp=frame_index / fps, players=players)
+                raw_frames.append(FramePoses(frame_index=frame_index, timestamp=frame_index / fps, players=players))
                 frame_index += 1
         finally:
             landmarker.close()
     finally:
         cap.release()
 
+    yield from _filter_to_most_active_tracks(raw_frames, max_players)
+
 
 _PLAYER_COLORS = [(0, 255, 0), (0, 128, 255), (255, 0, 255), (255, 255, 0)]
 
+# MediaPipe still returns a landmark for body parts it can't actually see —
+# occluded by the body's own pose, out of frame, motion-blurred mid-swing —
+# it just marks them with low visibility. Drawing those anyway is what a
+# "wild"/broken-looking skeleton usually is: real joints connected to
+# guessed ones. Skipping points and connections below this threshold trims
+# the guesses and leaves only the parts mediapipe actually saw.
+DEFAULT_MIN_LANDMARK_VISIBILITY = 0.5
+
 
 def draw_pose_overlay(
-    frame: np.ndarray, frame_poses: FramePoses, player_labels: dict[int, str] | None = None
+    frame: np.ndarray,
+    frame_poses: FramePoses,
+    player_labels: dict[int, str] | None = None,
+    min_landmark_visibility: float = DEFAULT_MIN_LANDMARK_VISIBILITY,
 ) -> np.ndarray:
     """Draw skeletons + a "player N" label per tracked player.
 
     ``player_labels``, if given, maps player_id -> extra text appended to
     that player's own label (e.g. "player 0 - FOREHAND") instead of a
-    separate floating label elsewhere in the frame.
+    separate floating label elsewhere in the frame. Landmarks/connections
+    below ``min_landmark_visibility`` are skipped rather than drawn as
+    guesses (see DEFAULT_MIN_LANDMARK_VISIBILITY).
     """
     annotated = frame.copy()
     for player in frame_poses.players:
         color = _PLAYER_COLORS[player.player_id % len(_PLAYER_COLORS)]
         pts = player.landmarks_px
+        visible = player.visibility >= min_landmark_visibility
 
         for start, end in SKELETON_CONNECTIONS:
+            if not (visible[start] and visible[end]):
+                continue
             p1, p2 = pts[start], pts[end]
             cv2.line(annotated, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), color, 2)
-        for x, y in pts:
+        for (x, y), ok in zip(pts, visible):
+            if not ok:
+                continue
             cv2.circle(annotated, (int(x), int(y)), 3, color, -1)
 
         x_min, y_min, x_max, y_max = player.bbox
@@ -331,6 +402,8 @@ def visualize(
     max_players: int = 2,
     model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
     pose_confidence: float = 0.5,
+    over_detect_poses: int | None = None,
+    min_landmark_visibility: float = DEFAULT_MIN_LANDMARK_VISIBILITY,
 ) -> int:
     """Write an annotated copy of ``video_path`` with skeleton overlays to ``output_path``."""
     cap = cv2.VideoCapture(str(video_path))
@@ -350,12 +423,12 @@ def visualize(
         for frame_poses in track_poses(
             video_path, max_players=max_players, model_variant=model_variant,
             min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
-            min_tracking_confidence=pose_confidence,
+            min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
         ):
             ok, frame = cap.read()
             if not ok:
                 break
-            annotated = draw_pose_overlay(frame, frame_poses)
+            annotated = draw_pose_overlay(frame, frame_poses, min_landmark_visibility=min_landmark_visibility)
             writer.write(annotated)
             frame_count += 1
     finally:
@@ -381,6 +454,15 @@ def main(argv: list[str] | None = None) -> int:
         "--pose-confidence", type=float, default=0.5,
         help="Lower (e.g. 0.3) if players are going undetected; raises false positives as a tradeoff.",
     )
+    viz_p.add_argument(
+        "--over-detect-poses", type=int, default=None,
+        help="Candidates tracked per frame before filtering to --max-players (default: max(6, max_players*3)). "
+        "Raise this if the wrong people (ball kids, umpire) are being picked as players.",
+    )
+    viz_p.add_argument(
+        "--min-landmark-visibility", type=float, default=DEFAULT_MIN_LANDMARK_VISIBILITY,
+        help="Skip drawing skeleton points/lines mediapipe is less than this confident it actually saw.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -388,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
         count = visualize(
             args.video, args.output_video, max_players=args.max_players,
             model_variant=args.model_variant, pose_confidence=args.pose_confidence,
+            over_detect_poses=args.over_detect_poses, min_landmark_visibility=args.min_landmark_visibility,
         )
         print(f"Wrote {count} annotated frames to {args.output_video}")
         return 0

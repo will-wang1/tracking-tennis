@@ -92,11 +92,12 @@ def run_physics_pipeline(
     tracknet_device: str = "cpu",
     pose_model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
     pose_confidence: float = 0.5,
+    over_detect_poses: int | None = None,
 ) -> list[PhysicsShotResult]:
     frame_poses_list = list(track_poses(
         video_path, max_players=max_players, model_variant=pose_model_variant,
         min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
-        min_tracking_confidence=pose_confidence,
+        min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
     ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
@@ -210,6 +211,11 @@ def main(argv: list[str] | None = None) -> int:
         "--pose-confidence", type=float, default=0.5,
         help="Lower (e.g. 0.3) if players are going undetected during real play; raises false positives as a tradeoff.",
     )
+    parser.add_argument(
+        "--over-detect-poses", type=int, default=None,
+        help="Candidates tracked per frame before filtering to --max-players (default: max(6, max_players*3)). "
+        "Raise this if the wrong people (ball kids, umpire) are being picked as players.",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -227,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         args.video, calibration, handedness, max_players=args.max_players,
         detector=args.detector, tracknet_model_path=args.tracknet_model, tracknet_device=args.tracknet_device,
         pose_model_variant=args.pose_model_variant, pose_confidence=args.pose_confidence,
+        over_detect_poses=args.over_detect_poses,
     )
     write_physics_shot_log(results, args.output_log)
 
