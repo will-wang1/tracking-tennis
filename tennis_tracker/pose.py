@@ -58,12 +58,24 @@ def _suppress_native_stderr():
         os.close(saved_fd)
 
 
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
-)
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
-DEFAULT_MODEL_PATH = DEFAULT_MODEL_DIR / "pose_landmarker_lite.task"
+
+# "lite" is fastest but least accurate; players who are small/distant in a
+# typical broadcast-angle tennis shot are exactly the case it struggles
+# with. Offline batch processing isn't latency-sensitive, so "full" is a
+# meaningfully more accurate default for little extra cost; "heavy" is the
+# most accurate still if "full" isn't enough.
+POSE_MODEL_VARIANTS = ("lite", "full", "heavy")
+DEFAULT_POSE_MODEL_VARIANT = "full"
+
+
+def _model_url(variant: str) -> str:
+    name = f"pose_landmarker_{variant}"
+    return f"https://storage.googleapis.com/mediapipe-models/pose_landmarker/{name}/float16/latest/{name}.task"
+
+
+def _default_model_path(variant: str) -> Path:
+    return DEFAULT_MODEL_DIR / f"pose_landmarker_{variant}.task"
 
 # (landmark_index, landmark_index) pairs to draw as skeleton edges.
 SKELETON_CONNECTIONS = [(c.start, c.end) for c in PoseLandmarksConnections.POSE_LANDMARKS]
@@ -94,12 +106,15 @@ class FramePoses:
     players: list[PlayerPose] = field(default_factory=list)
 
 
-def ensure_model(model_path: Path = DEFAULT_MODEL_PATH) -> Path:
-    """Download the pose landmarker model on first use; reuse the cached copy after."""
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    if not model_path.exists():
-        urllib.request.urlretrieve(MODEL_URL, model_path)
-    return model_path
+def ensure_model(variant: str = DEFAULT_POSE_MODEL_VARIANT, model_path: Path | None = None) -> Path:
+    """Download the requested pose landmarker model variant on first use; reuse the cached copy after."""
+    if variant not in POSE_MODEL_VARIANTS:
+        raise ValueError(f"Unknown pose model variant {variant!r}; choose from {POSE_MODEL_VARIANTS}")
+    path = model_path or _default_model_path(variant)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        urllib.request.urlretrieve(_model_url(variant), path)
+    return path
 
 
 def _centroid(landmarks_px: np.ndarray) -> np.ndarray:
@@ -199,18 +214,35 @@ def _landmarks_to_pixels(pose_landmarks, width: int, height: int) -> tuple[np.nd
     return pts, visibility, bbox
 
 
-def track_poses(video_path: str | Path, max_players: int = 2, model_path: Path = DEFAULT_MODEL_PATH):
-    """Yield a FramePoses per video frame, with player IDs stable across frames."""
+def track_poses(
+    video_path: str | Path,
+    max_players: int = 2,
+    model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
+    min_pose_detection_confidence: float = 0.5,
+    min_pose_presence_confidence: float = 0.5,
+    min_tracking_confidence: float = 0.5,
+    model_path: Path | None = None,
+):
+    """Yield a FramePoses per video frame, with player IDs stable across frames.
+
+    If players are going undetected during real play (not just briefly
+    mid-swing, which PlayerTracker already tolerates, but genuinely missing
+    for long stretches), the two things worth trying first are a larger
+    ``model_variant`` ("full" or "heavy" — "lite" is fastest but least
+    accurate, and struggles most with players who are small/distant in
+    frame, which is normal for a broadcast-angle tennis shot) and lowering
+    the confidence thresholds below their conservative 0.5 defaults.
+    """
     path = Path(video_path)
-    resolved_model_path = ensure_model(model_path)
+    resolved_model_path = ensure_model(model_variant, model_path)
 
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(resolved_model_path)),
         running_mode=VisionTaskRunningMode.VIDEO,
         num_poses=max_players,
-        min_pose_detection_confidence=0.5,
-        min_pose_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
+        min_pose_detection_confidence=min_pose_detection_confidence,
+        min_pose_presence_confidence=min_pose_presence_confidence,
+        min_tracking_confidence=min_tracking_confidence,
     )
 
     cap = cv2.VideoCapture(str(path))
@@ -293,7 +325,13 @@ def draw_pose_overlay(
     return annotated
 
 
-def visualize(video_path: str | Path, output_path: str | Path, max_players: int = 2) -> int:
+def visualize(
+    video_path: str | Path,
+    output_path: str | Path,
+    max_players: int = 2,
+    model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
+    pose_confidence: float = 0.5,
+) -> int:
     """Write an annotated copy of ``video_path`` with skeleton overlays to ``output_path``."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -309,7 +347,11 @@ def visualize(video_path: str | Path, output_path: str | Path, max_players: int 
     cap = cv2.VideoCapture(str(video_path))
     frame_count = 0
     try:
-        for frame_poses in track_poses(video_path, max_players=max_players):
+        for frame_poses in track_poses(
+            video_path, max_players=max_players, model_variant=model_variant,
+            min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
+            min_tracking_confidence=pose_confidence,
+        ):
             ok, frame = cap.read()
             if not ok:
                 break
@@ -331,11 +373,22 @@ def main(argv: list[str] | None = None) -> int:
     viz_p.add_argument("video", help="Path to the source video file.")
     viz_p.add_argument("output_video", help="Path to write the annotated video to.")
     viz_p.add_argument("--max-players", type=int, default=2)
+    viz_p.add_argument(
+        "--model-variant", choices=POSE_MODEL_VARIANTS, default=DEFAULT_POSE_MODEL_VARIANT,
+        help='"lite" is fastest but least accurate; try "full" or "heavy" if players go undetected.',
+    )
+    viz_p.add_argument(
+        "--pose-confidence", type=float, default=0.5,
+        help="Lower (e.g. 0.3) if players are going undetected; raises false positives as a tradeoff.",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "visualize":
-        count = visualize(args.video, args.output_video, max_players=args.max_players)
+        count = visualize(
+            args.video, args.output_video, max_players=args.max_players,
+            model_variant=args.model_variant, pose_confidence=args.pose_confidence,
+        )
         print(f"Wrote {count} annotated frames to {args.output_video}")
         return 0
 

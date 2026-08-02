@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from tennis_tracker.pose import PlayerTracker
+from tennis_tracker.pose import PlayerTracker, ensure_model
 
 
 def _fake_detection(center_x, center_y, size=20.0):
@@ -82,3 +82,23 @@ def test_track_expires_after_too_many_consecutive_misses():
     players = tracker.update([_fake_detection(100, 200)])
 
     assert {p.player_id for p in players} == {1}
+
+
+def test_ensure_model_rejects_unknown_variant():
+    with pytest.raises(ValueError, match="Unknown pose model variant"):
+        ensure_model(variant="ultra")
+
+
+def test_ensure_model_reuses_cached_file_without_redownloading(tmp_path, monkeypatch):
+    fake_path = tmp_path / "pose_landmarker_lite.task"
+    fake_path.write_bytes(b"fake model bytes")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not attempt to download when the file already exists")
+
+    monkeypatch.setattr("tennis_tracker.pose.urllib.request.urlretrieve", fail_if_called)
+
+    result = ensure_model(variant="lite", model_path=fake_path)
+
+    assert result == fake_path
+    assert result.read_bytes() == b"fake model bytes"

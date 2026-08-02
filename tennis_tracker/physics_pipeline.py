@@ -27,7 +27,7 @@ from tennis_tracker.classify import Handedness, classify_pose, nearest_player
 from tennis_tracker.contact_fit import ContactEvent, fit_contact_event
 from tennis_tracker.physics import TennisBallParams
 from tennis_tracker.pipeline import get_ball_detections, parse_handedness_arg
-from tennis_tracker.pose import track_poses
+from tennis_tracker.pose import DEFAULT_POSE_MODEL_VARIANT, POSE_MODEL_VARIANTS, track_poses
 from tennis_tracker.trajectory import HitEvent, detect_hits, smooth_trajectory
 
 MPS_TO_KMH = 3.6
@@ -90,8 +90,14 @@ def run_physics_pipeline(
     detector: str = "classical",
     tracknet_model_path: str | Path | None = None,
     tracknet_device: str = "cpu",
+    pose_model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
+    pose_confidence: float = 0.5,
 ) -> list[PhysicsShotResult]:
-    frame_poses_list = list(track_poses(video_path, max_players=max_players))
+    frame_poses_list = list(track_poses(
+        video_path, max_players=max_players, model_variant=pose_model_variant,
+        min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
+        min_tracking_confidence=pose_confidence,
+    ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
     cap = cv2.VideoCapture(str(video_path))
@@ -196,6 +202,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--tracknet-model", default=None, help="Trained TrackNet checkpoint (from tracknet.py train).")
     parser.add_argument("--tracknet-device", default="cpu", help='"cpu" or "cuda", for the tracknet detector.')
+    parser.add_argument(
+        "--pose-model-variant", choices=POSE_MODEL_VARIANTS, default=DEFAULT_POSE_MODEL_VARIANT,
+        help='"lite" is fastest but least accurate; try "full" (default) or "heavy" if players go undetected.',
+    )
+    parser.add_argument(
+        "--pose-confidence", type=float, default=0.5,
+        help="Lower (e.g. 0.3) if players are going undetected during real play; raises false positives as a tradeoff.",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -212,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
     results = run_physics_pipeline(
         args.video, calibration, handedness, max_players=args.max_players,
         detector=args.detector, tracknet_model_path=args.tracknet_model, tracknet_device=args.tracknet_device,
+        pose_model_variant=args.pose_model_variant, pose_confidence=args.pose_confidence,
     )
     write_physics_shot_log(results, args.output_log)
 

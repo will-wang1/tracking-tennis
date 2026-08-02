@@ -16,7 +16,13 @@ import numpy as np
 
 from tennis_tracker.ball import BallDetection, detect_video
 from tennis_tracker.classify import NO_POSE_DATA, Handedness, ShotClassification, classify_hits
-from tennis_tracker.pose import FramePoses, draw_pose_overlay, track_poses
+from tennis_tracker.pose import (
+    DEFAULT_POSE_MODEL_VARIANT,
+    POSE_MODEL_VARIANTS,
+    FramePoses,
+    draw_pose_overlay,
+    track_poses,
+)
 from tennis_tracker.trajectory import HitEvent, TrackedPoint, detect_hits, smooth_trajectory
 
 # How many frames after a hit its shot-type label stays drawn on screen,
@@ -112,9 +118,15 @@ def run_pipeline(
     tracknet_model_path: str | Path | None = None,
     tracknet_device: str = "cpu",
     max_ball_gap_sec: float = DEFAULT_MAX_BALL_GAP_SEC,
+    pose_model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
+    pose_confidence: float = 0.5,
 ) -> PipelineResult:
     """Run pose tracking, ball tracking, hit detection, and classification over a video."""
-    frame_poses_list = list(track_poses(video_path, max_players=max_players))
+    frame_poses_list = list(track_poses(
+        video_path, max_players=max_players, model_variant=pose_model_variant,
+        min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
+        min_tracking_confidence=pose_confidence,
+    ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
     cap = cv2.VideoCapture(str(video_path))
@@ -270,6 +282,14 @@ def main(argv: list[str] | None = None) -> int:
         "--max-ball-gap-sec", type=float, default=DEFAULT_MAX_BALL_GAP_SEC,
         help="Gap in ball detections (seconds) that marks the point as over; tracking/hits stop there.",
     )
+    parser.add_argument(
+        "--pose-model-variant", choices=POSE_MODEL_VARIANTS, default=DEFAULT_POSE_MODEL_VARIANT,
+        help='"lite" is fastest but least accurate; try "full" (default) or "heavy" if players go undetected.',
+    )
+    parser.add_argument(
+        "--pose-confidence", type=float, default=0.5,
+        help="Lower (e.g. 0.3) if players are going undetected during real play; raises false positives as a tradeoff.",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -282,7 +302,8 @@ def main(argv: list[str] | None = None) -> int:
     result = run_pipeline(
         args.video, handedness, max_players=args.max_players, ball_detector_kwargs=ball_detector_kwargs,
         detector=args.detector, tracknet_model_path=args.tracknet_model, tracknet_device=args.tracknet_device,
-        max_ball_gap_sec=args.max_ball_gap_sec,
+        max_ball_gap_sec=args.max_ball_gap_sec, pose_model_variant=args.pose_model_variant,
+        pose_confidence=args.pose_confidence,
     )
 
     write_shot_log(result.classifications, args.output_log)
