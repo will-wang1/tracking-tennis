@@ -52,3 +52,33 @@ def test_new_detection_far_from_existing_tracks_gets_new_id():
     players = tracker.update([_fake_detection(100, 200), _fake_detection(500, 200)])
 
     assert {p.player_id for p in players} == {0, 1}
+
+
+def test_survives_a_brief_miss_by_extrapolating_velocity():
+    # Player moving 40px/frame in x. A frozen last-known-position match
+    # (100 -> 140, then missed a frame, reappears at 220) would be 80px
+    # away from the last real detection — past max_match_distance=50 — so
+    # without velocity prediction this would incorrectly get a new ID.
+    tracker = PlayerTracker(max_players=2, max_match_distance=50.0)
+    tracker.update([_fake_detection(100, 200)])
+    tracker.update([_fake_detection(140, 200)])
+
+    tracker.update([])  # missed frame: motion blur / brief occlusion mid-swing
+
+    players = tracker.update([_fake_detection(220, 200)])
+
+    assert {p.player_id for p in players} == {0}
+
+
+def test_track_expires_after_too_many_consecutive_misses():
+    tracker = PlayerTracker(max_players=2, max_match_distance=50.0, max_missed_frames=3)
+    tracker.update([_fake_detection(100, 200)])
+
+    for _ in range(4):  # more misses than max_missed_frames -> track 0 expires
+        tracker.update([])
+
+    # A new detection at the same old position must not reuse the expired
+    # track's ID — that would silently misattribute it to whoever left.
+    players = tracker.update([_fake_detection(100, 200)])
+
+    assert {p.player_id for p in players} == {1}

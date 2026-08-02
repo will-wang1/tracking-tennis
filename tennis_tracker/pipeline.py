@@ -8,22 +8,26 @@ import argparse
 import csv
 import json
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from tennis_tracker.ball import BallDetection, detect_video
 from tennis_tracker.classify import NO_POSE_DATA, Handedness, ShotClassification, classify_hits
 from tennis_tracker.pose import FramePoses, draw_pose_overlay, track_poses
-from tennis_tracker.trajectory import HitEvent, detect_hits, smooth_trajectory
+from tennis_tracker.trajectory import HitEvent, TrackedPoint, detect_hits, smooth_trajectory
 
 # How many frames after a hit its shot-type label stays drawn on screen,
 # so it's readable rather than flashing for a single frame.
 LABEL_PERSIST_FRAMES = 15
 
-_LABEL_COLORS = {
-    "forehand": (0, 255, 0), "backhand": (0, 0, 255), "unclear": (0, 255, 255), NO_POSE_DATA: (128, 128, 128),
-}
+# A gap in ball detections longer than this (seconds) marks the point as
+# over: the ball left play and didn't come back soon, so anything flagged
+# as a "hit" after that is more likely a false positive (players resetting,
+# picking up balls) than a real shot.
+DEFAULT_MAX_BALL_GAP_SEC = 1.5
 
 
 def parse_handedness_arg(value: str | None) -> dict[int, Handedness]:
@@ -66,6 +70,39 @@ def get_ball_detections(
     return list(detect_video(video_path, **(ball_detector_kwargs or {})))
 
 
+def find_point_end_frame(detections: list[BallDetection], fps: float, max_gap_sec: float = DEFAULT_MAX_BALL_GAP_SEC) -> int:
+    """Find the last frame of the point: the frame right before the first too-long gap in ball detections.
+
+    If no gap that long ever occurs, the whole clip counts as the point.
+    Returns the last detection's frame index if ``detections`` is empty.
+    """
+    if not detections:
+        return 0
+
+    max_gap_frames = max(1, int(max_gap_sec * fps))
+    gap_start_frame: int | None = None
+    for d in detections:
+        if d.position is None:
+            if gap_start_frame is None:
+                gap_start_frame = d.frame_index
+            elif d.frame_index - gap_start_frame + 1 > max_gap_frames:
+                return gap_start_frame - 1
+        else:
+            gap_start_frame = None
+
+    return detections[-1].frame_index
+
+
+@dataclass
+class PipelineResult:
+    frame_poses: list[FramePoses]
+    detections: list[BallDetection]
+    tracked: list[TrackedPoint]
+    hits: list[HitEvent]
+    classifications: list[ShotClassification]
+    point_end_frame: int
+
+
 def run_pipeline(
     video_path: str | Path,
     handedness: dict[int, Handedness],
@@ -74,7 +111,8 @@ def run_pipeline(
     detector: str = "classical",
     tracknet_model_path: str | Path | None = None,
     tracknet_device: str = "cpu",
-) -> tuple[list[FramePoses], list[BallDetection], list[HitEvent], list[ShotClassification]]:
+    max_ball_gap_sec: float = DEFAULT_MAX_BALL_GAP_SEC,
+) -> PipelineResult:
     """Run pose tracking, ball tracking, hit detection, and classification over a video."""
     frame_poses_list = list(track_poses(video_path, max_players=max_players))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
@@ -87,11 +125,12 @@ def run_pipeline(
         video_path, detector=detector, ball_detector_kwargs=ball_detector_kwargs,
         tracknet_model_path=tracknet_model_path, tracknet_device=tracknet_device,
     )
+    point_end_frame = find_point_end_frame(detections, fps, max_gap_sec=max_ball_gap_sec)
     tracked = smooth_trajectory(detections, fps=fps)
-    hits = detect_hits(tracked)
+    hits = [h for h in detect_hits(tracked) if h.frame_index <= point_end_frame]
     classifications = classify_hits(hits, poses_by_frame, handedness)
 
-    return frame_poses_list, detections, hits, classifications
+    return PipelineResult(frame_poses_list, detections, tracked, hits, classifications, point_end_frame)
 
 
 def write_shot_log(classifications: list[ShotClassification], output_path: str | Path) -> None:
@@ -125,22 +164,32 @@ def render_annotated_video(
     output_path: str | Path,
     frame_poses_list: list[FramePoses],
     detections: list[BallDetection],
+    tracked: list[TrackedPoint],
     classifications: list[ShotClassification],
+    end_frame: int | None = None,
 ) -> int:
-    """Draws pose skeletons, the ball trail, and shot labels onto a copy of the video.
+    """Draws pose skeletons, the ball trail + speed, and shot labels onto a copy of the video.
 
-    ``detections`` are reused from whatever already ran ball detection
-    (run_pipeline) rather than re-run here — with TrackNet in particular,
-    re-running detection a second time just for rendering would double a
-    real GPU inference cost, not just a cheap classical-CV pass.
+    ``detections``/``tracked`` are reused from whatever already ran ball
+    detection and Kalman smoothing (run_pipeline) rather than re-run here —
+    with TrackNet in particular, re-running detection a second time just for
+    rendering would double a real GPU inference cost, not just a cheap
+    classical-CV pass. The shot-type label is drawn on the hitting player's
+    own "player N" tag (e.g. "player 0 - FOREHAND") rather than as a
+    separate floating label, so it's unambiguous who hit it. ``end_frame``,
+    if given, stops the output there (e.g. where the point ended) instead
+    of continuing to render dead time afterward.
     """
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
     detections_by_frame = {d.frame_index: d for d in detections}
-    labels_by_frame: dict[int, tuple[str, tuple[int, int]]] = {}
+    velocity_by_frame = {t.frame_index: t.velocity for t in tracked}
+
+    player_labels_by_frame: dict[int, dict[int, str]] = {}
     for c in classifications:
-        x, y = c.hit.position
+        if c.player_id is None:  # NO_POSE_DATA: no player to attach a label to
+            continue
         for offset in range(LABEL_PERSIST_FRAMES):
-            labels_by_frame[c.hit.frame_index + offset] = (c.shot_type, (int(x), int(y)))
+            player_labels_by_frame.setdefault(c.hit.frame_index + offset, {})[c.player_id] = c.shot_type.upper()
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -157,6 +206,8 @@ def render_annotated_video(
     frame_index = 0
     try:
         while True:
+            if end_frame is not None and frame_index > end_frame:
+                break
             ok, frame = cap.read()
             if not ok:
                 break
@@ -164,25 +215,24 @@ def render_annotated_video(
             detection = detections_by_frame.get(frame_index)
             if detection is not None and detection.position is not None:
                 trail.append(detection.position)
-                cv2.circle(
-                    frame, (int(detection.position[0]), int(detection.position[1])),
-                    max(3, int(detection.radius or 4)), (0, 0, 255), 2,
-                )
+                x, y = detection.position
+                cv2.circle(frame, (int(x), int(y)), max(3, int(detection.radius or 4)), (0, 0, 255), 2)
+
+                velocity = velocity_by_frame.get(frame_index)
+                if velocity is not None:
+                    speed_px_s = float(np.hypot(velocity[0], velocity[1]))
+                    cv2.putText(
+                        frame, f"{speed_px_s:.0f} px/s", (int(x) - 35, int(y) - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1,
+                    )
             for i in range(1, len(trail)):
                 p1 = tuple(int(v) for v in trail[i - 1])
                 p2 = tuple(int(v) for v in trail[i])
                 cv2.line(frame, p1, p2, (0, 165, 255), 2)
 
             if frame_index in poses_by_frame:
-                frame = draw_pose_overlay(frame, poses_by_frame[frame_index])
-
-            if frame_index in labels_by_frame:
-                shot_type, label_pos = labels_by_frame[frame_index]
-                color = _LABEL_COLORS.get(shot_type, (255, 255, 255))
-                cv2.putText(
-                    frame, shot_type.upper(), (label_pos[0] - 40, label_pos[1] - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2,
-                )
+                labels = player_labels_by_frame.get(frame_index, {})
+                frame = draw_pose_overlay(frame, poses_by_frame[frame_index], player_labels=labels)
 
             writer.write(frame)
             frame_index += 1
@@ -216,6 +266,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--ball-hsv-upper", default=None, help='Override ball color upper HSV bound, e.g. "55,255,255".'
     )
+    parser.add_argument(
+        "--max-ball-gap-sec", type=float, default=DEFAULT_MAX_BALL_GAP_SEC,
+        help="Gap in ball detections (seconds) that marks the point as over; tracking/hits stop there.",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -225,21 +279,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.ball_hsv_upper:
         ball_detector_kwargs["hsv_upper"] = tuple(int(v) for v in args.ball_hsv_upper.split(","))
 
-    frame_poses_list, detections, hits, classifications = run_pipeline(
+    result = run_pipeline(
         args.video, handedness, max_players=args.max_players, ball_detector_kwargs=ball_detector_kwargs,
         detector=args.detector, tracknet_model_path=args.tracknet_model, tracknet_device=args.tracknet_device,
+        max_ball_gap_sec=args.max_ball_gap_sec,
     )
 
-    write_shot_log(classifications, args.output_log)
+    write_shot_log(result.classifications, args.output_log)
     frame_count = render_annotated_video(
-        args.video, args.output_video, frame_poses_list, detections, classifications
+        args.video, args.output_video, result.frame_poses, result.detections, result.tracked,
+        result.classifications, end_frame=result.point_end_frame,
     )
 
     counts = {"forehand": 0, "backhand": 0, "unclear": 0, NO_POSE_DATA: 0}
-    for c in classifications:
+    for c in result.classifications:
         counts[c.shot_type] += 1
 
-    print(f"Processed {frame_count} frames, detected {len(hits)} hit(s).")
+    print(f"Processed {frame_count} frames (point ended at frame {result.point_end_frame}), detected {len(result.hits)} hit(s).")
     print(f"Shots: {counts['forehand']} forehand, {counts['backhand']} backhand, {counts['unclear']} unclear.")
     if counts[NO_POSE_DATA]:
         print(

@@ -10,17 +10,12 @@ frames, so this module adds a small nearest-centroid tracker on top to keep
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
+import sys
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-
-# Must be set before the first mediapipe import below: silences the
-# "Created TensorFlow Lite XNNPACK delegate", "Feedback manager requires...",
-# and "Using NORM_RECT without IMAGE_DIMENSIONS" lines mediapipe/TFLite/absl
-# print on every run — all benign and non-actionable, not actual errors.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-os.environ.setdefault("GLOG_minloglevel", "2")
 
 import cv2
 import numpy as np
@@ -34,6 +29,34 @@ from mediapipe.tasks.python.vision import (
 from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
     VisionTaskRunningMode,
 )
+
+@contextlib.contextmanager
+def _suppress_native_stderr():
+    """Redirect the OS-level stderr file descriptor to devnull for the block.
+
+    mediapipe/TFLite write some benign startup/per-inference notices
+    ("Created TensorFlow Lite XNNPACK delegate", "Feedback manager
+    requires...", "Using NORM_RECT without IMAGE_DIMENSIONS...") straight to
+    the native stderr fd from C++, bypassing Python's logging entirely —
+    TF_CPP_MIN_LOG_LEVEL/GLOG_minloglevel don't reliably suppress them in
+    this build. Redirecting the fd itself works regardless of which native
+    logging library wrote it. Scoped tightly around one call at a time
+    (never held open across a generator's yield) so a real error elsewhere
+    is never at risk of being silently swallowed.
+    """
+    stderr_fd = sys.stderr.fileno()
+    saved_fd = os.dup(stderr_fd)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        sys.stderr.flush()
+        os.dup2(devnull_fd, stderr_fd)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, stderr_fd)
+        os.close(devnull_fd)
+        os.close(saved_fd)
+
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
@@ -84,13 +107,31 @@ def _centroid(landmarks_px: np.ndarray) -> np.ndarray:
 
 
 class PlayerTracker:
-    """Greedy nearest-centroid tracker that keeps player IDs stable across frames."""
+    """Greedy nearest-centroid tracker that keeps player IDs stable across frames.
 
-    def __init__(self, max_players: int = 2, max_match_distance: float = 100.0):
+    A player briefly missing a detection — motion blur or self-occlusion
+    during a fast swing, exactly the moment a shot happens — used to risk an
+    ID swap: the track's last-known position stayed frozen while they kept
+    moving, so by the time they reappeared they could be too far from that
+    frozen spot to match. This predicts each missed track's position forward
+    using its last observed velocity instead of assuming it stood still, and
+    expires a track only after ``max_missed_frames`` consecutive misses, so
+    a stale track can't linger forever and steal a match from someone new.
+    """
+
+    def __init__(self, max_players: int = 2, max_match_distance: float = 100.0, max_missed_frames: int = 15):
         self.max_players = max_players
         self.max_match_distance = max_match_distance
+        self.max_missed_frames = max_missed_frames
         self._next_id = 0
         self._track_centroids: dict[int, np.ndarray] = {}
+        self._track_velocities: dict[int, np.ndarray] = {}
+        self._track_missed_count: dict[int, int] = {}
+
+    def _predicted_centroid(self, track_id: int) -> np.ndarray:
+        missed = self._track_missed_count.get(track_id, 0)
+        velocity = self._track_velocities.get(track_id, np.zeros(2))
+        return self._track_centroids[track_id] + velocity * (missed + 1)
 
     def update(self, detections: list[tuple[np.ndarray, np.ndarray, tuple]]) -> list[PlayerPose]:
         """``detections`` is a list of (landmarks_px, visibility, bbox). Returns assigned PlayerPoses."""
@@ -99,11 +140,12 @@ class PlayerTracker:
         unmatched_detections = set(range(len(detections)))
         assignments: dict[int, int] = {}  # detection_index -> track_id
 
-        # Greedy matching: repeatedly pick the closest (track, detection) pair.
+        # Greedy matching: repeatedly pick the closest (predicted track, detection) pair.
         candidate_pairs = []
-        for track_id, track_centroid in self._track_centroids.items():
+        for track_id in self._track_centroids:
+            predicted = self._predicted_centroid(track_id)
             for det_idx, det_centroid in enumerate(centroids):
-                dist = float(np.linalg.norm(track_centroid - det_centroid))
+                dist = float(np.linalg.norm(predicted - det_centroid))
                 if dist <= self.max_match_distance:
                     candidate_pairs.append((dist, track_id, det_idx))
         candidate_pairs.sort(key=lambda p: p[0])
@@ -127,8 +169,22 @@ class PlayerTracker:
         players: list[PlayerPose] = []
         for det_idx, track_id in assignments.items():
             landmarks_px, visibility, bbox = detections[det_idx]
-            self._track_centroids[track_id] = centroids[det_idx]
+            new_centroid = centroids[det_idx]
+            if track_id in self._track_centroids:
+                self._track_velocities[track_id] = new_centroid - self._track_centroids[track_id]
+            self._track_centroids[track_id] = new_centroid
+            self._track_missed_count[track_id] = 0
             players.append(PlayerPose(track_id, landmarks_px, visibility, bbox))
+
+        matched_track_ids = set(assignments.values())
+        for track_id in list(self._track_centroids):
+            if track_id in matched_track_ids:
+                continue
+            self._track_missed_count[track_id] = self._track_missed_count.get(track_id, 0) + 1
+            if self._track_missed_count[track_id] > self.max_missed_frames:
+                del self._track_centroids[track_id]
+                self._track_velocities.pop(track_id, None)  # never set if only matched once
+                del self._track_missed_count[track_id]
 
         players.sort(key=lambda p: p.player_id)
         return players
@@ -165,7 +221,9 @@ def track_poses(video_path: str | Path, max_players: int = 2, model_path: Path =
     tracker = PlayerTracker(max_players=max_players, max_match_distance=cap.get(cv2.CAP_PROP_FRAME_WIDTH) * MAX_MATCH_DISTANCE_FRAC)
 
     try:
-        with PoseLandmarker.create_from_options(options) as landmarker:
+        with _suppress_native_stderr():
+            landmarker = PoseLandmarker.create_from_options(options)
+        try:
             frame_index = 0
             while True:
                 ok, frame = cap.read()
@@ -177,7 +235,8 @@ def track_poses(video_path: str | Path, max_players: int = 2, model_path: Path =
                 mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
                 timestamp_ms = int((frame_index / fps) * 1000)
 
-                result = landmarker.detect_for_video(mp_image, timestamp_ms)
+                with _suppress_native_stderr():
+                    result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
                 detections = [
                     _landmarks_to_pixels(pose_landmarks, width, height)
@@ -187,6 +246,8 @@ def track_poses(video_path: str | Path, max_players: int = 2, model_path: Path =
 
                 yield FramePoses(frame_index=frame_index, timestamp=frame_index / fps, players=players)
                 frame_index += 1
+        finally:
+            landmarker.close()
     finally:
         cap.release()
 
@@ -194,7 +255,15 @@ def track_poses(video_path: str | Path, max_players: int = 2, model_path: Path =
 _PLAYER_COLORS = [(0, 255, 0), (0, 128, 255), (255, 0, 255), (255, 255, 0)]
 
 
-def draw_pose_overlay(frame: np.ndarray, frame_poses: FramePoses) -> np.ndarray:
+def draw_pose_overlay(
+    frame: np.ndarray, frame_poses: FramePoses, player_labels: dict[int, str] | None = None
+) -> np.ndarray:
+    """Draw skeletons + a "player N" label per tracked player.
+
+    ``player_labels``, if given, maps player_id -> extra text appended to
+    that player's own label (e.g. "player 0 - FOREHAND") instead of a
+    separate floating label elsewhere in the frame.
+    """
     annotated = frame.copy()
     for player in frame_poses.players:
         color = _PLAYER_COLORS[player.player_id % len(_PLAYER_COLORS)]
@@ -208,9 +277,13 @@ def draw_pose_overlay(frame: np.ndarray, frame_poses: FramePoses) -> np.ndarray:
 
         x_min, y_min, x_max, y_max = player.bbox
         cv2.rectangle(annotated, (x_min, y_min), (x_max, y_max), color, 1)
+        label = f"player {player.player_id}"
+        extra = (player_labels or {}).get(player.player_id)
+        if extra:
+            label = f"{label} - {extra}"
         cv2.putText(
             annotated,
-            f"player {player.player_id}",
+            label,
             (x_min, max(0, y_min - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,

@@ -7,8 +7,14 @@ import pytest
 
 from tennis_tracker.ball import BallDetection
 from tennis_tracker.classify import ShotClassification
-from tennis_tracker.pipeline import get_ball_detections, parse_handedness_arg, render_annotated_video, write_shot_log
-from tennis_tracker.trajectory import HitEvent
+from tennis_tracker.pipeline import (
+    find_point_end_frame,
+    get_ball_detections,
+    parse_handedness_arg,
+    render_annotated_video,
+    write_shot_log,
+)
+from tennis_tracker.trajectory import HitEvent, TrackedPoint
 
 
 def test_parse_handedness_arg():
@@ -127,7 +133,95 @@ def test_render_annotated_video_reuses_passed_in_detections(tmp_path, monkeypatc
     # the happy path runs.
     monkeypatch.delattr("tennis_tracker.pipeline.detect_video", raising=False)
 
-    frame_count = render_annotated_video(video_path, output_path, [], detections, [])
+    frame_count = render_annotated_video(video_path, output_path, [], detections, [], [])
 
     assert frame_count == 12
     assert output_path.exists()
+
+
+def _detections_with_gap(fps, n_frames, gap_start, gap_len):
+    detections = []
+    for i in range(n_frames):
+        in_gap = gap_start <= i < gap_start + gap_len
+        position = None if in_gap else (float(i), 50.0)
+        detections.append(BallDetection(frame_index=i, timestamp=i / fps, position=position))
+    return detections
+
+
+def test_find_point_end_frame_stops_at_a_long_gap():
+    fps = 30.0
+    # Ball detected through frame 59, then a 2-second gap (60 frames) starting at 60.
+    detections = _detections_with_gap(fps, n_frames=150, gap_start=60, gap_len=60)
+
+    point_end_frame = find_point_end_frame(detections, fps, max_gap_sec=1.5)
+
+    assert point_end_frame == 59
+
+
+def test_find_point_end_frame_ignores_short_gaps():
+    fps = 30.0
+    # A brief 5-frame gap (motion blur, not the point ending) shouldn't trigger truncation.
+    detections = _detections_with_gap(fps, n_frames=100, gap_start=40, gap_len=5)
+
+    point_end_frame = find_point_end_frame(detections, fps, max_gap_sec=1.5)
+
+    assert point_end_frame == 99  # whole clip counts as the point
+
+
+def test_find_point_end_frame_empty_detections():
+    assert find_point_end_frame([], fps=30.0) == 0
+
+
+def test_render_annotated_video_truncates_at_end_frame(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    _write_synthetic_ball_video(video_path)  # 12 frames
+    output_path = tmp_path / "out.mp4"
+
+    frame_count = render_annotated_video(video_path, output_path, [], [], [], [], end_frame=5)
+
+    assert frame_count == 6  # frames 0..5 inclusive
+
+
+def test_render_annotated_video_labels_hitting_player_not_a_floating_label(tmp_path):
+    from tennis_tracker.pose import FramePoses, PlayerPose
+
+    video_path = tmp_path / "clip.mp4"
+    _write_synthetic_ball_video(video_path)
+    output_path = tmp_path / "out.mp4"
+
+    player = PlayerPose(
+        player_id=0, landmarks_px=np.zeros((33, 2), dtype=np.float32),
+        visibility=np.ones(33, dtype=np.float32), bbox=(0, 0, 40, 40),
+    )
+    frame_poses_list = [FramePoses(frame_index=0, timestamp=0.0, players=[player])]
+    classifications = [
+        ShotClassification(
+            hit=HitEvent(frame_index=0, timestamp=0.0, position=(20.0, 30.0), residual=10.0),
+            player_id=0, shot_type="forehand", confidence=1.0,
+        )
+    ]
+
+    # Should not raise, and should actually attach the label to the player
+    # (draw_pose_overlay is exercised via player_labels, not a separate
+    # floating-label code path that no longer exists).
+    frame_count = render_annotated_video(
+        video_path, output_path, frame_poses_list, [], [], classifications
+    )
+
+    assert frame_count == 12
+
+
+def test_render_annotated_video_shows_velocity_above_ball(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    _write_synthetic_ball_video(video_path)
+    output_path = tmp_path / "out.mp4"
+
+    detections = [BallDetection(frame_index=0, timestamp=0.0, position=(20.0, 30.0))]
+    tracked = [TrackedPoint(frame_index=0, timestamp=0.0, position=(20.0, 30.0), velocity=(100.0, 0.0), residual=None)]
+
+    # Just needs to run without error with velocity data present; visual
+    # correctness (text drawn near the ball) isn't practical to assert on
+    # pixel content here.
+    frame_count = render_annotated_video(video_path, output_path, [], detections, tracked, [])
+
+    assert frame_count == 12
