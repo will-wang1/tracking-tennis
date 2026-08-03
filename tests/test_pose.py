@@ -5,7 +5,10 @@ from tennis_tracker.pose import (
     FramePoses,
     PlayerPose,
     PlayerTracker,
+    _detect_pose_in_crop,
     _filter_to_most_active_tracks,
+    _pad_and_clip_box,
+    _yolo_person_boxes,
     draw_pose_overlay,
     ensure_model,
 )
@@ -194,3 +197,99 @@ def test_draw_pose_overlay_draws_high_visibility_landmarks():
     annotated = draw_pose_overlay(blank, frame_poses)
 
     assert tuple(annotated[center_y, center_x]) != (0, 0, 0)
+
+
+class _FakeYoloBox:
+    def __init__(self, xyxy, conf):
+        self.xyxy = [xyxy]
+        self.conf = [conf]
+
+
+class _FakeYoloResults:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+
+class _FakeYoloModel:
+    def __init__(self, boxes):
+        self._boxes = boxes
+
+    def predict(self, frame, classes, conf, device, verbose):
+        return [_FakeYoloResults(self._boxes)]
+
+
+def test_yolo_person_boxes_sorts_by_confidence_and_caps_count():
+    boxes = [
+        _FakeYoloBox((0.0, 0.0, 10.0, 10.0), 0.3),
+        _FakeYoloBox((20.0, 20.0, 30.0, 30.0), 0.9),
+        _FakeYoloBox((40.0, 40.0, 50.0, 50.0), 0.6),
+    ]
+    model = _FakeYoloModel(boxes)
+    frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    result = _yolo_person_boxes(model, frame, confidence=0.1, max_people=2, device="cpu")
+
+    assert result == [(20.0, 20.0, 30.0, 30.0), (40.0, 40.0, 50.0, 50.0)]
+
+
+def test_pad_and_clip_box_adds_proportional_padding():
+    # A 20x20 box padded 25% each side should grow by 5px on every edge.
+    result = _pad_and_clip_box((10, 10, 30, 30), padding_frac=0.25, frame_width=100, frame_height=100)
+
+    assert result == (5, 5, 35, 35)
+
+
+def test_pad_and_clip_box_clips_at_frame_edges():
+    result = _pad_and_clip_box((0, 0, 20, 20), padding_frac=0.5, frame_width=100, frame_height=100)
+
+    assert result == (0, 0, 30, 30)
+
+
+class _FakeLandmark:
+    def __init__(self, x, y, visibility=1.0):
+        self.x = x
+        self.y = y
+        self.visibility = visibility
+
+
+class _FakeLandmarker:
+    def __init__(self, pose_landmarks=None):
+        self._pose_landmarks = pose_landmarks or []
+
+    def detect(self, mp_image):
+        class _Result:
+            pass
+
+        result = _Result()
+        result.pose_landmarks = self._pose_landmarks
+        return result
+
+
+def test_detect_pose_in_crop_maps_landmarks_back_to_full_frame_coords():
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    crop_box = (50, 60, 150, 160)  # 100x100 crop
+    landmarker = _FakeLandmarker(pose_landmarks=[[_FakeLandmark(0.5, 0.5)]])
+
+    result = _detect_pose_in_crop(landmarker, frame, crop_box)
+
+    assert result is not None
+    pts, visibility, bbox = result
+    assert tuple(pts[0]) == pytest.approx((100.0, 110.0))
+
+
+def test_detect_pose_in_crop_returns_none_when_no_pose_found():
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    landmarker = _FakeLandmarker(pose_landmarks=[])
+
+    result = _detect_pose_in_crop(landmarker, frame, (50, 60, 150, 160))
+
+    assert result is None
+
+
+def test_detect_pose_in_crop_returns_none_for_degenerate_box():
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    landmarker = _FakeLandmarker(pose_landmarks=[[_FakeLandmark(0.5, 0.5)]])
+
+    result = _detect_pose_in_crop(landmarker, frame, (50, 60, 50, 160))  # zero width
+
+    assert result is None

@@ -26,8 +26,8 @@ from tennis_tracker.calibration import CameraCalibration, calibrate_camera, load
 from tennis_tracker.classify import Handedness, classify_pose, nearest_player
 from tennis_tracker.contact_fit import ContactEvent, fit_contact_event
 from tennis_tracker.physics import TennisBallParams
-from tennis_tracker.pipeline import get_ball_detections, parse_handedness_arg
-from tennis_tracker.pose import DEFAULT_POSE_MODEL_VARIANT, POSE_MODEL_VARIANTS, track_poses
+from tennis_tracker.pipeline import BALL_DETECTORS, get_ball_detections, parse_handedness_arg
+from tennis_tracker.pose import DEFAULT_POSE_MODEL_VARIANT, PERSON_DETECTORS, POSE_MODEL_VARIANTS, track_poses
 from tennis_tracker.trajectory import HitEvent, detect_hits, smooth_trajectory
 
 MPS_TO_KMH = 3.6
@@ -90,14 +90,23 @@ def run_physics_pipeline(
     detector: str = "classical",
     tracknet_model_path: str | Path | None = None,
     tracknet_device: str = "cpu",
+    yolo_ball_model_path: str | None = None,
+    yolo_ball_confidence: float = 0.25,
+    yolo_ball_device: str = "cpu",
     pose_model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
     pose_confidence: float = 0.5,
     over_detect_poses: int | None = None,
+    person_detector: str = "mediapipe",
+    yolo_person_model_path: str | None = None,
+    yolo_person_confidence: float = 0.4,
+    yolo_person_device: str = "cpu",
 ) -> list[PhysicsShotResult]:
     frame_poses_list = list(track_poses(
         video_path, max_players=max_players, model_variant=pose_model_variant,
         min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
         min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
+        person_detector=person_detector, yolo_model_path=yolo_person_model_path,
+        yolo_confidence=yolo_person_confidence, yolo_device=yolo_person_device,
     ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
@@ -108,6 +117,7 @@ def run_physics_pipeline(
     detections = get_ball_detections(
         video_path, detector=detector, ball_detector_kwargs=ball_detector_kwargs,
         tracknet_model_path=tracknet_model_path, tracknet_device=tracknet_device,
+        yolo_model_path=yolo_ball_model_path, yolo_confidence=yolo_ball_confidence, yolo_device=yolo_ball_device,
     )
     tracked = smooth_trajectory(detections, fps=fps)
     hits = detect_hits(tracked)
@@ -198,11 +208,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--handedness", default="", help='e.g. "0:right,1:left". Defaults to right.')
     parser.add_argument("--max-players", type=int, default=2)
     parser.add_argument(
-        "--detector", choices=["classical", "tracknet"], default="classical",
-        help='Ball detector to use. "tracknet" requires --tracknet-model.',
+        "--detector", choices=list(BALL_DETECTORS), default="classical",
+        help='Ball detector to use. "tracknet" requires --tracknet-model and is trained specifically for a tennis '
+        'ball; "yolo" needs no training (auto-downloads a pretrained model) but detects any COCO "sports ball".',
     )
     parser.add_argument("--tracknet-model", default=None, help="Trained TrackNet checkpoint (from tracknet.py train).")
     parser.add_argument("--tracknet-device", default="cpu", help='"cpu" or "cuda", for the tracknet detector.')
+    parser.add_argument(
+        "--yolo-ball-model", default=None,
+        help='ultralytics model name/path for --detector yolo (default: "yolov5su.pt", auto-downloaded).',
+    )
+    parser.add_argument("--yolo-ball-confidence", type=float, default=0.25)
+    parser.add_argument("--yolo-ball-device", default="cpu", help='"cpu" or "cuda", for --detector yolo.')
     parser.add_argument(
         "--pose-model-variant", choices=POSE_MODEL_VARIANTS, default=DEFAULT_POSE_MODEL_VARIANT,
         help='"lite" is fastest but least accurate; try "full" (default) or "heavy" if players go undetected.',
@@ -216,6 +233,18 @@ def main(argv: list[str] | None = None) -> int:
         help="Candidates tracked per frame before filtering to --max-players (default: max(6, max_players*3)). "
         "Raise this if the wrong people (ball kids, umpire) are being picked as players.",
     )
+    parser.add_argument(
+        "--person-detector", choices=list(PERSON_DETECTORS), default="mediapipe",
+        help='"yolo" finds each person with YOLO first and runs pose estimation on a zoomed-in crop of just them, '
+        "which detects small/distant players in a wide shot far more reliably than mediapipe's own whole-frame "
+        "person detection.",
+    )
+    parser.add_argument(
+        "--yolo-person-model", default=None,
+        help='ultralytics model name/path for --person-detector yolo (default: "yolov5su.pt", auto-downloaded).',
+    )
+    parser.add_argument("--yolo-person-confidence", type=float, default=0.4)
+    parser.add_argument("--yolo-person-device", default="cpu", help='"cpu" or "cuda", for --person-detector yolo.')
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -232,8 +261,12 @@ def main(argv: list[str] | None = None) -> int:
     results = run_physics_pipeline(
         args.video, calibration, handedness, max_players=args.max_players,
         detector=args.detector, tracknet_model_path=args.tracknet_model, tracknet_device=args.tracknet_device,
+        yolo_ball_model_path=args.yolo_ball_model, yolo_ball_confidence=args.yolo_ball_confidence,
+        yolo_ball_device=args.yolo_ball_device,
         pose_model_variant=args.pose_model_variant, pose_confidence=args.pose_confidence,
         over_detect_poses=args.over_detect_poses,
+        person_detector=args.person_detector, yolo_person_model_path=args.yolo_person_model,
+        yolo_person_confidence=args.yolo_person_confidence, yolo_person_device=args.yolo_person_device,
     )
     write_physics_shot_log(results, args.output_log)
 

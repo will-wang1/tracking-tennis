@@ -101,6 +101,23 @@ def test_get_ball_detections_tracknet(tmp_path):
     assert all(d.frame_index == i for i, d in enumerate(detections))
 
 
+def test_get_ball_detections_yolo(tmp_path, monkeypatch):
+    # ultralytics isn't a hard requirement to run these tests, so the
+    # YoloBallDetector itself is stubbed out rather than actually loaded --
+    # this exercises get_ball_detections' wiring (lazy import, kwargs,
+    # per-frame BallDetection contract) without needing the real model.
+    video_path = tmp_path / "clip.mp4"
+    _write_synthetic_ball_video(video_path)
+
+    monkeypatch.setattr("tennis_tracker.yolo_ball.YoloBallDetector.__init__", lambda self, **kwargs: None)
+    monkeypatch.setattr("tennis_tracker.yolo_ball.YoloBallDetector.detect", lambda self, frame: ((25.0, 35.0), 5.0))
+
+    detections = get_ball_detections(video_path, detector="yolo")
+
+    assert len(detections) == 12
+    assert all(d.position == (25.0, 35.0) for d in detections)
+
+
 def test_get_ball_detections_tracknet_requires_model_path(tmp_path):
     video_path = tmp_path / "clip.mp4"
     _write_synthetic_ball_video(video_path)

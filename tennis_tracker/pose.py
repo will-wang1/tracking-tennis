@@ -1,10 +1,16 @@
 """Phase 2: player detection + pose estimation via MediaPipe Pose Landmarker.
 
-MediaPipe's PoseLandmarker natively supports detecting multiple people
-per frame (num_poses=2 covers both players), so a separate YOLOv8 person
-detector isn't needed. What it doesn't give us is a stable identity across
-frames, so this module adds a small nearest-centroid tracker on top to keep
-"player 0" / "player 1" consistent over time.
+MediaPipe's PoseLandmarker natively supports detecting multiple people per
+frame (num_poses=2 covers both players) directly off the whole frame, which
+is the default here and needs no separate person detector. What it doesn't
+give us is a stable identity across frames, so this module adds a small
+nearest-centroid tracker on top to keep "player 0" / "player 1" consistent
+over time.
+
+Optionally (``person_detector="yolo"``), a YOLO person detector runs first
+and pose estimation is done on a zoomed-in crop of each detected person
+instead of the whole frame — see track_poses()'s docstring for when that's
+worth it.
 """
 
 from __future__ import annotations
@@ -214,6 +220,68 @@ def _landmarks_to_pixels(pose_landmarks, width: int, height: int) -> tuple[np.nd
     return pts, visibility, bbox
 
 
+PERSON_DETECTORS = ("mediapipe", "yolo")
+COCO_PERSON_CLASS = 0
+DEFAULT_YOLO_PERSON_MODEL = "yolov5su.pt"
+# How much padding (as a fraction of box width/height) to add around each
+# YOLO person box before cropping — enough slack that limbs extending past
+# the box (a raised racket arm, a follow-through leg) aren't cut off, without
+# padding so much the crop stops zooming in on the person.
+YOLO_CROP_PADDING_FRAC = 0.25
+
+
+def _yolo_person_boxes(
+    model, frame: np.ndarray, confidence: float, max_people: int, device: str
+) -> list[tuple[float, float, float, float]]:
+    """Return up to ``max_people`` (x1, y1, x2, y2) person boxes, highest-confidence first."""
+    results = model.predict(frame, classes=[COCO_PERSON_CLASS], conf=confidence, device=device, verbose=False)[0]
+    scored = [(float(box.conf[0]), tuple(float(v) for v in box.xyxy[0])) for box in results.boxes]
+    scored.sort(key=lambda s: -s[0])
+    return [box for _, box in scored[:max_people]]
+
+
+def _pad_and_clip_box(
+    box: tuple[float, float, float, float], padding_frac: float, frame_width: int, frame_height: int
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    pad_x, pad_y = (x2 - x1) * padding_frac, (y2 - y1) * padding_frac
+    cx1 = max(0, int(x1 - pad_x))
+    cy1 = max(0, int(y1 - pad_y))
+    cx2 = min(frame_width, int(x2 + pad_x))
+    cy2 = min(frame_height, int(y2 + pad_y))
+    return cx1, cy1, cx2, cy2
+
+
+def _detect_pose_in_crop(landmarker, frame: np.ndarray, crop_box: tuple[int, int, int, int]):
+    """Run single-person pose detection on one cropped/padded region, mapped back to full-frame pixels.
+
+    Zooming into just the region YOLO already found a person in gives the
+    pose model far more effective resolution on that person than it'd get
+    from the whole (often wide, broadcast-angle) frame — the same crop of a
+    small/distant player fills the model's input instead of shrinking to a
+    handful of pixels within it, which is exactly the case mediapipe's own
+    whole-frame multi-person detection struggles with most.
+    """
+    cx1, cy1, cx2, cy2 = crop_box
+    crop = frame[cy1:cy2, cx1:cx2]
+    if crop.size == 0:
+        return None
+
+    rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
+    with _suppress_native_stderr():
+        result = landmarker.detect(mp_image)
+    if not result.pose_landmarks:
+        return None
+
+    crop_height, crop_width = crop.shape[:2]
+    pts, visibility, bbox = _landmarks_to_pixels(result.pose_landmarks[0], crop_width, crop_height)
+    pts[:, 0] += cx1
+    pts[:, 1] += cy1
+    bbox = (bbox[0] + cx1, bbox[1] + cy1, bbox[2] + cx1, bbox[3] + cy1)
+    return pts, visibility, bbox
+
+
 def _filter_to_most_active_tracks(frame_poses_list: list[FramePoses], max_players: int) -> list[FramePoses]:
     """Keep only the ``max_players`` tracks with the most total movement, remapped to sequential IDs.
 
@@ -263,6 +331,11 @@ def track_poses(
     model_path: Path | None = None,
     over_detect_poses: int | None = None,
     verbose: bool = False,
+    person_detector: str = "mediapipe",
+    yolo_model_path: str | None = None,
+    yolo_confidence: float = 0.4,
+    yolo_device: str = "cpu",
+    yolo_crop_padding: float = YOLO_CROP_PADDING_FRAC,
 ):
     """Yield a FramePoses per video frame, with player IDs stable across frames.
 
@@ -279,16 +352,39 @@ def track_poses(
     ``max(6, max_players * 3)``) — more candidates are tracked internally
     per frame, and only the ``max_players`` tracks that moved the most
     across the whole clip are kept and returned as the players.
+
+    ``person_detector="yolo"`` swaps mediapipe's own whole-frame person
+    detection for a YOLO person detector: it finds each person's box first,
+    then pose estimation runs on a zoomed/padded crop of just them (see
+    ``_detect_pose_in_crop``). This is the fix worth trying if players are
+    small/distant in a wide broadcast-angle shot — a whole-frame detector
+    like mediapipe's shrinks them further just to fit its input, while a
+    per-person crop keeps them filling it.
     """
+    if person_detector not in PERSON_DETECTORS:
+        raise ValueError(f"Unknown person_detector {person_detector!r}; choose from {PERSON_DETECTORS}")
+
     over_detect_poses = over_detect_poses or max(6, max_players * 3)
 
     path = Path(video_path)
     resolved_model_path = ensure_model(model_variant, model_path)
 
+    yolo_model = None
+    if person_detector == "yolo":
+        # Imported lazily so the default mediapipe-only path never pulls in ultralytics.
+        from ultralytics import YOLO
+
+        yolo_model = YOLO(yolo_model_path or DEFAULT_YOLO_PERSON_MODEL)
+        running_mode = VisionTaskRunningMode.IMAGE
+        num_poses = 1  # one person per crop
+    else:
+        running_mode = VisionTaskRunningMode.VIDEO
+        num_poses = over_detect_poses
+
     options = PoseLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(resolved_model_path)),
-        running_mode=VisionTaskRunningMode.VIDEO,
-        num_poses=over_detect_poses,
+        running_mode=running_mode,
+        num_poses=num_poses,
         min_pose_detection_confidence=min_pose_detection_confidence,
         min_pose_presence_confidence=min_pose_presence_confidence,
         min_tracking_confidence=min_tracking_confidence,
@@ -300,8 +396,10 @@ def track_poses(
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     tracker = PlayerTracker(
-        max_players=over_detect_poses, max_match_distance=cap.get(cv2.CAP_PROP_FRAME_WIDTH) * MAX_MATCH_DISTANCE_FRAC
+        max_players=over_detect_poses, max_match_distance=frame_width * MAX_MATCH_DISTANCE_FRAC
     )
 
     raw_frames: list[FramePoses] = []
@@ -315,18 +413,28 @@ def track_poses(
                 if not ok:
                     break
 
-                height, width = frame.shape[:2]
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
-                timestamp_ms = int((frame_index / fps) * 1000)
+                if person_detector == "yolo":
+                    boxes = _yolo_person_boxes(yolo_model, frame, yolo_confidence, over_detect_poses, yolo_device)
+                    detections = []
+                    for box in boxes:
+                        crop_box = _pad_and_clip_box(box, yolo_crop_padding, frame_width, frame_height)
+                        detection = _detect_pose_in_crop(landmarker, frame, crop_box)
+                        if detection is not None:
+                            detections.append(detection)
+                else:
+                    height, width = frame.shape[:2]
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
+                    timestamp_ms = int((frame_index / fps) * 1000)
 
-                with _suppress_native_stderr():
-                    result = landmarker.detect_for_video(mp_image, timestamp_ms)
+                    with _suppress_native_stderr():
+                        result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-                detections = [
-                    _landmarks_to_pixels(pose_landmarks, width, height)
-                    for pose_landmarks in result.pose_landmarks
-                ]
+                    detections = [
+                        _landmarks_to_pixels(pose_landmarks, width, height)
+                        for pose_landmarks in result.pose_landmarks
+                    ]
+
                 players = tracker.update(detections)
 
                 raw_frames.append(FramePoses(frame_index=frame_index, timestamp=frame_index / fps, players=players))
@@ -410,6 +518,10 @@ def visualize(
     pose_confidence: float = 0.5,
     over_detect_poses: int | None = None,
     min_landmark_visibility: float = DEFAULT_MIN_LANDMARK_VISIBILITY,
+    person_detector: str = "mediapipe",
+    yolo_model_path: str | None = None,
+    yolo_confidence: float = 0.4,
+    yolo_device: str = "cpu",
 ) -> int:
     """Write an annotated copy of ``video_path`` with skeleton overlays to ``output_path``."""
     cap = cv2.VideoCapture(str(video_path))
@@ -430,6 +542,8 @@ def visualize(
             video_path, max_players=max_players, model_variant=model_variant,
             min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
             min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
+            person_detector=person_detector, yolo_model_path=yolo_model_path,
+            yolo_confidence=yolo_confidence, yolo_device=yolo_device,
         ):
             ok, frame = cap.read()
             if not ok:
@@ -469,6 +583,18 @@ def main(argv: list[str] | None = None) -> int:
         "--min-landmark-visibility", type=float, default=DEFAULT_MIN_LANDMARK_VISIBILITY,
         help="Skip drawing skeleton points/lines mediapipe is less than this confident it actually saw.",
     )
+    viz_p.add_argument(
+        "--person-detector", choices=list(PERSON_DETECTORS), default="mediapipe",
+        help='"yolo" finds each person with YOLO first and runs pose estimation on a zoomed-in crop of just them, '
+        "which detects small/distant players in a wide shot far more reliably than mediapipe's own whole-frame "
+        "person detection.",
+    )
+    viz_p.add_argument(
+        "--yolo-model", default=None,
+        help='ultralytics model name/path for --person-detector yolo (default: "yolov5su.pt", auto-downloaded).',
+    )
+    viz_p.add_argument("--yolo-confidence", type=float, default=0.4)
+    viz_p.add_argument("--yolo-device", default="cpu", help='"cpu" or "cuda", for --person-detector yolo.')
 
     args = parser.parse_args(argv)
 
@@ -477,6 +603,8 @@ def main(argv: list[str] | None = None) -> int:
             args.video, args.output_video, max_players=args.max_players,
             model_variant=args.model_variant, pose_confidence=args.pose_confidence,
             over_detect_poses=args.over_detect_poses, min_landmark_visibility=args.min_landmark_visibility,
+            person_detector=args.person_detector, yolo_model_path=args.yolo_model,
+            yolo_confidence=args.yolo_confidence, yolo_device=args.yolo_device,
         )
         print(f"Wrote {count} annotated frames to {args.output_video}")
         return 0

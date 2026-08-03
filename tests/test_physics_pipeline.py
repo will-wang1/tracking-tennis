@@ -162,7 +162,7 @@ def test_run_physics_pipeline_threads_detector_choice_through(tmp_path, monkeypa
     captured = {}
 
     def fake_get_ball_detections(video_path, detector="classical", ball_detector_kwargs=None,
-                                  tracknet_model_path=None, tracknet_device="cpu"):
+                                  tracknet_model_path=None, tracknet_device="cpu", **kwargs):
         captured.update(
             detector=detector, tracknet_model_path=tracknet_model_path, tracknet_device=tracknet_device
         )
