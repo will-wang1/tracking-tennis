@@ -49,7 +49,11 @@ def test_write_shot_log_json(tmp_path):
 
     data = json.loads(out_path.read_text())
 
-    assert data["summary"] == {"forehand": 1, "backhand": 1, "unclear": 0, "no_pose_data": 0}
+    # Only shot types actually present are counted -- this must work for any
+    # classifier's label vocabulary, not just the geometric heuristic's fixed
+    # forehand/backhand/unclear/no_pose_data set, so zero-count types aren't
+    # padded in.
+    assert data["summary"] == {"forehand": 1, "backhand": 1}
     assert len(data["shots"]) == 2
     assert data["shots"][0]["shot_type"] == "forehand"
     assert data["shots"][0]["frame_index"] == 10

@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,7 +15,13 @@ import cv2
 import numpy as np
 
 from tennis_tracker.ball import BallDetection, detect_video
-from tennis_tracker.classify import NO_POSE_DATA, Handedness, ShotClassification, classify_hits
+from tennis_tracker.classify import (
+    DEFAULT_SHOT_CLASSIFIER_WINDOW,
+    NO_POSE_DATA,
+    Handedness,
+    ShotClassification,
+    classify_hits,
+)
 from tennis_tracker.pose import (
     DEFAULT_MIN_LANDMARK_VISIBILITY,
     DEFAULT_POSE_MODEL_VARIANT,
@@ -145,6 +151,9 @@ def run_pipeline(
     yolo_person_model_path: str | None = None,
     yolo_person_confidence: float = 0.4,
     yolo_person_device: str = "cpu",
+    shot_classifier_model_path: str | Path | None = None,
+    shot_classifier_device: str = "cpu",
+    shot_classifier_window: int = DEFAULT_SHOT_CLASSIFIER_WINDOW,
     verbose: bool = True,
 ) -> PipelineResult:
     """Run pose tracking, ball tracking, hit detection, and classification over a video.
@@ -181,7 +190,17 @@ def run_pipeline(
     point_end_frame = find_point_end_frame(detections, fps, max_gap_sec=max_ball_gap_sec)
     tracked = smooth_trajectory(detections, fps=fps)
     hits = [h for h in detect_hits(tracked) if h.frame_index <= point_end_frame]
-    classifications = classify_hits(hits, poses_by_frame, handedness)
+
+    shot_classifier_model = None
+    if shot_classifier_model_path is not None:
+        # Imported lazily so not using this option never pulls in torch.
+        from tennis_tracker.shot_classifier import load_model as load_shot_classifier
+
+        shot_classifier_model = load_shot_classifier(shot_classifier_model_path, device=shot_classifier_device)
+    classifications = classify_hits(
+        hits, poses_by_frame, handedness,
+        shot_classifier_model=shot_classifier_model, shot_classifier_window=shot_classifier_window,
+    )
 
     return PipelineResult(frame_poses_list, detections, tracked, hits, classifications, point_end_frame)
 
@@ -198,9 +217,7 @@ def write_shot_log(classifications: list[ShotClassification], output_path: str |
         }
         for c in classifications
     ]
-    counts = {"forehand": 0, "backhand": 0, "unclear": 0, NO_POSE_DATA: 0}
-    for row in rows:
-        counts[row["shot_type"]] += 1
+    counts = dict(Counter(row["shot_type"] for row in rows))
 
     if path.suffix.lower() == ".csv":
         with path.open("w", newline="") as f:
@@ -363,6 +380,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--yolo-person-confidence", type=float, default=0.4)
     parser.add_argument("--yolo-person-device", default="cpu", help='"cpu" or "cuda", for --person-detector yolo.')
+    parser.add_argument(
+        "--shot-classifier-model", default=None,
+        help="Trained shot-classifier checkpoint (from shot_classifier.py train). Replaces the geometric "
+        "forehand/backhand heuristic with a learned classifier that can distinguish more shot types, whenever "
+        "enough frames of the hitting player's pose are available around the hit.",
+    )
+    parser.add_argument("--shot-classifier-device", default="cpu", help='"cpu" or "cuda", for --shot-classifier-model.')
+    parser.add_argument(
+        "--shot-classifier-window", type=int, default=DEFAULT_SHOT_CLASSIFIER_WINDOW,
+        help="Frames each side of a hit to feed the shot classifier (roughly a full swing's worth at 30fps).",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -381,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
         pose_confidence=args.pose_confidence, over_detect_poses=args.over_detect_poses,
         person_detector=args.person_detector, yolo_person_model_path=args.yolo_person_model,
         yolo_person_confidence=args.yolo_person_confidence, yolo_person_device=args.yolo_person_device,
+        shot_classifier_model_path=args.shot_classifier_model, shot_classifier_device=args.shot_classifier_device,
+        shot_classifier_window=args.shot_classifier_window,
     )
 
     write_shot_log(result.classifications, args.output_log)
@@ -390,15 +420,15 @@ def main(argv: list[str] | None = None) -> int:
         min_landmark_visibility=args.min_landmark_visibility,
     )
 
-    counts = {"forehand": 0, "backhand": 0, "unclear": 0, NO_POSE_DATA: 0}
-    for c in result.classifications:
-        counts[c.shot_type] += 1
+    counts = Counter(c.shot_type for c in result.classifications)
+    no_pose_count = counts.pop(NO_POSE_DATA, 0)
 
     print(f"Processed {frame_count} frames (point ended at frame {result.point_end_frame}), detected {len(result.hits)} hit(s).")
-    print(f"Shots: {counts['forehand']} forehand, {counts['backhand']} backhand, {counts['unclear']} unclear.")
-    if counts[NO_POSE_DATA]:
+    shot_summary = ", ".join(f"{n} {shot_type}" for shot_type, n in counts.most_common()) or "none"
+    print(f"Shots: {shot_summary}.")
+    if no_pose_count:
         print(
-            f"({counts[NO_POSE_DATA]} hit(s) could not be classified — no player pose found nearby, "
+            f"({no_pose_count} hit(s) could not be classified — no player pose found nearby, "
             "e.g. occluded or briefly out of frame during the swing)"
         )
     print(f"Annotated video: {args.output_video}")
