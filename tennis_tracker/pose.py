@@ -262,6 +262,7 @@ def track_poses(
     min_tracking_confidence: float = 0.5,
     model_path: Path | None = None,
     over_detect_poses: int | None = None,
+    verbose: bool = False,
 ):
     """Yield a FramePoses per video frame, with player IDs stable across frames.
 
@@ -298,16 +299,17 @@ def track_poses(
         raise RuntimeError(f"Could not open video: {path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     tracker = PlayerTracker(
         max_players=over_detect_poses, max_match_distance=cap.get(cv2.CAP_PROP_FRAME_WIDTH) * MAX_MATCH_DISTANCE_FRAC
     )
 
     raw_frames: list[FramePoses] = []
+    frame_index = 0
     try:
         with _suppress_native_stderr():
             landmarker = PoseLandmarker.create_from_options(options)
         try:
-            frame_index = 0
             while True:
                 ok, frame = cap.read()
                 if not ok:
@@ -329,10 +331,14 @@ def track_poses(
 
                 raw_frames.append(FramePoses(frame_index=frame_index, timestamp=frame_index / fps, players=players))
                 frame_index += 1
+                if verbose and (frame_index % 30 == 0 or frame_index == total_frames):
+                    print(f"\rpose tracking: frame {frame_index}/{total_frames or '?'}", end="", flush=True)
         finally:
             landmarker.close()
     finally:
         cap.release()
+        if verbose and frame_index:
+            print()  # newline after the live-updating progress line
 
     yield from _filter_to_most_active_tracks(raw_frames, max_players)
 

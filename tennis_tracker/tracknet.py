@@ -415,6 +415,7 @@ def run_tracknet_on_video(
     input_size: tuple[int, int] = DEFAULT_INPUT_SIZE,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     device: str = "cpu",
+    verbose: bool = False,
 ):
     """Yield a BallDetection per frame of ``video_path`` using a trained TrackNet model.
 
@@ -431,6 +432,7 @@ def run_tracknet_on_video(
         raise RuntimeError(f"Could not open video: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     width, height = input_size
@@ -465,8 +467,12 @@ def run_tracknet_on_video(
 
                 yield BallDetection(frame_index=frame_index, timestamp=frame_index / fps, position=position)
                 frame_index += 1
+                if verbose and (frame_index % 30 == 0 or frame_index == total_frames):
+                    print(f"\rball detection: frame {frame_index}/{total_frames or '?'}", end="", flush=True)
     finally:
         cap.release()
+        if verbose and frame_index:
+            print()  # newline after the live-updating progress line
 
 
 def visualize(

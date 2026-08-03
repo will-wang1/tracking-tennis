@@ -54,6 +54,7 @@ def get_ball_detections(
     ball_detector_kwargs: dict | None = None,
     tracknet_model_path: str | Path | None = None,
     tracknet_device: str = "cpu",
+    verbose: bool = False,
 ) -> list[BallDetection]:
     """Run ball detection with either the classical CV detector or a trained TrackNet model.
 
@@ -69,7 +70,7 @@ def get_ball_detections(
         from tennis_tracker.tracknet import load_model, run_tracknet_on_video
 
         model = load_model(tracknet_model_path, device=tracknet_device)
-        return list(run_tracknet_on_video(video_path, model, device=tracknet_device))
+        return list(run_tracknet_on_video(video_path, model, device=tracknet_device, verbose=verbose))
 
     if detector != "classical":
         raise ValueError(f'detector must be "classical" or "tracknet", got {detector!r}')
@@ -122,12 +123,22 @@ def run_pipeline(
     pose_model_variant: str = DEFAULT_POSE_MODEL_VARIANT,
     pose_confidence: float = 0.5,
     over_detect_poses: int | None = None,
+    verbose: bool = True,
 ) -> PipelineResult:
-    """Run pose tracking, ball tracking, hit detection, and classification over a video."""
+    """Run pose tracking, ball tracking, hit detection, and classification over a video.
+
+    Both stages below fully process the video before returning (nothing
+    streams through to the caller frame-by-frame), so with ``verbose=True``
+    (the default) each stage prints its own progress — otherwise, especially
+    on CPU where either stage can take minutes, the whole call just looks
+    frozen with no way to tell it's still working.
+    """
+    if verbose:
+        print("Tracking player poses...")
     frame_poses_list = list(track_poses(
         video_path, max_players=max_players, model_variant=pose_model_variant,
         min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
-        min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
+        min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses, verbose=verbose,
     ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
@@ -135,9 +146,11 @@ def run_pipeline(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
 
+    if verbose:
+        print(f"Detecting ball position ({detector})...")
     detections = get_ball_detections(
         video_path, detector=detector, ball_detector_kwargs=ball_detector_kwargs,
-        tracknet_model_path=tracknet_model_path, tracknet_device=tracknet_device,
+        tracknet_model_path=tracknet_model_path, tracknet_device=tracknet_device, verbose=verbose,
     )
     point_end_frame = find_point_end_frame(detections, fps, max_gap_sec=max_ball_gap_sec)
     tracked = smooth_trajectory(detections, fps=fps)
