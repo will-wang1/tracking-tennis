@@ -1,13 +1,6 @@
 import numpy as np
-import pytest
 
-from tennis_tracker.classify import (
-    NO_POSE_DATA,
-    classify_hits,
-    classify_pose,
-    nearest_player,
-    player_landmark_window,
-)
+from tennis_tracker.classify import NO_POSE_DATA, classify_hits, classify_pose, nearest_player
 from tennis_tracker.pose import (
     FramePoses,
     LEFT_HIP,
@@ -148,66 +141,3 @@ def test_classify_hits_keeps_one_result_per_hit_even_with_mixed_outcomes():
     assert len(results) == len(hits)
     assert [r.shot_type for r in results] == ["forehand", NO_POSE_DATA, NO_POSE_DATA]
 
-
-def _pose_at(player_id, x_offset):
-    return _make_pose(
-        player_id,
-        (LEFT_SHOULDER_PX[0] + x_offset, LEFT_SHOULDER_PX[1]),
-        (RIGHT_SHOULDER_PX[0] + x_offset, RIGHT_SHOULDER_PX[1]),
-        (LEFT_HIP_PX[0] + x_offset, LEFT_HIP_PX[1]),
-        (RIGHT_HIP_PX[0] + x_offset, RIGHT_HIP_PX[1]),
-        left_wrist=(60 + x_offset, 110),
-        right_wrist=(190 + x_offset, 90),
-    )
-
-
-def test_player_landmark_window_gathers_only_the_requested_player_across_the_window():
-    other_player = _pose_at(1, x_offset=0)
-    poses_by_frame = {
-        8: FramePoses(frame_index=8, timestamp=8 / 30, players=[_pose_at(0, 0), other_player]),
-        9: FramePoses(frame_index=9, timestamp=9 / 30, players=[other_player]),  # player 0 missing this frame
-        10: FramePoses(frame_index=10, timestamp=10 / 30, players=[_pose_at(0, 1), other_player]),
-    }
-
-    sequence = player_landmark_window(poses_by_frame, player_id=0, center_frame=9, window=1)
-
-    assert len(sequence) == 2  # frames 8 and 10 only -- frame 9 had no player 0
-
-
-def test_classify_hits_falls_back_to_heuristic_with_too_few_classifier_frames():
-    pytest.importorskip("torch")
-    from tennis_tracker.shot_classifier import ShotClassifierNet
-
-    forehand_pose = _make_pose(
-        0, LEFT_SHOULDER_PX, RIGHT_SHOULDER_PX, LEFT_HIP_PX, RIGHT_HIP_PX,
-        left_wrist=(60, 110), right_wrist=(190, 90),
-    )
-    frame_poses = FramePoses(frame_index=10, timestamp=10 / 30, players=[forehand_pose])
-    hit = HitEvent(frame_index=10, timestamp=10 / 30, position=(100.0, 100.0), residual=20.0)
-    model = ShotClassifierNet(num_classes=2, window_frames=4)
-    model.class_names = ["slice", "smash"]
-
-    # Only one frame of pose data exists at all -- below MIN_SHOT_CLASSIFIER_FRAMES
-    # -- so this must fall back to the geometric heuristic instead of feeding
-    # the classifier a near-empty sequence.
-    results = classify_hits([hit], {10: frame_poses}, handedness={0: "right"}, shot_classifier_model=model)
-
-    assert results[0].shot_type == "forehand"
-
-
-def test_classify_hits_uses_shot_classifier_when_enough_frames_available():
-    pytest.importorskip("torch")
-    from tennis_tracker.shot_classifier import ShotClassifierNet
-
-    poses_by_frame = {
-        f: FramePoses(frame_index=f, timestamp=f / 30, players=[_pose_at(0, x_offset=f)]) for f in range(0, 21)
-    }
-    hit = HitEvent(frame_index=10, timestamp=10 / 30, position=(100.0, 100.0), residual=20.0)
-    model = ShotClassifierNet(num_classes=2, window_frames=4)
-    model.class_names = ["slice", "smash"]
-
-    results = classify_hits([hit], poses_by_frame, handedness={0: "right"}, shot_classifier_model=model)
-
-    # Enough frames were available (21 total, window=15 default) -> the
-    # classifier's own vocabulary is used, not the heuristic's forehand/backhand.
-    assert results[0].shot_type in {"slice", "smash"}

@@ -16,7 +16,6 @@ import numpy as np
 
 from tennis_tracker.ball import BallDetection, detect_video
 from tennis_tracker.classify import (
-    DEFAULT_SHOT_CLASSIFIER_WINDOW,
     NO_POSE_DATA,
     Handedness,
     ShotClassification,
@@ -151,9 +150,6 @@ def run_pipeline(
     yolo_person_model_path: str | None = None,
     yolo_person_confidence: float = 0.4,
     yolo_person_device: str = "cpu",
-    shot_classifier_model_path: str | Path | None = None,
-    shot_classifier_device: str = "cpu",
-    shot_classifier_window: int = DEFAULT_SHOT_CLASSIFIER_WINDOW,
     verbose: bool = True,
 ) -> PipelineResult:
     """Run pose tracking, ball tracking, hit detection, and classification over a video.
@@ -191,16 +187,7 @@ def run_pipeline(
     tracked = smooth_trajectory(detections, fps=fps)
     hits = [h for h in detect_hits(tracked) if h.frame_index <= point_end_frame]
 
-    shot_classifier_model = None
-    if shot_classifier_model_path is not None:
-        # Imported lazily so not using this option never pulls in torch.
-        from tennis_tracker.shot_classifier import load_model as load_shot_classifier
-
-        shot_classifier_model = load_shot_classifier(shot_classifier_model_path, device=shot_classifier_device)
-    classifications = classify_hits(
-        hits, poses_by_frame, handedness,
-        shot_classifier_model=shot_classifier_model, shot_classifier_window=shot_classifier_window,
-    )
+    classifications = classify_hits(hits, poses_by_frame, handedness)
 
     return PipelineResult(frame_poses_list, detections, tracked, hits, classifications, point_end_frame)
 
@@ -380,17 +367,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--yolo-person-confidence", type=float, default=0.4)
     parser.add_argument("--yolo-person-device", default="cpu", help='"cpu" or "cuda", for --person-detector yolo.')
-    parser.add_argument(
-        "--shot-classifier-model", default=None,
-        help="Trained shot-classifier checkpoint (from shot_classifier.py train). Replaces the geometric "
-        "forehand/backhand heuristic with a learned classifier that can distinguish more shot types, whenever "
-        "enough frames of the hitting player's pose are available around the hit.",
-    )
-    parser.add_argument("--shot-classifier-device", default="cpu", help='"cpu" or "cuda", for --shot-classifier-model.')
-    parser.add_argument(
-        "--shot-classifier-window", type=int, default=DEFAULT_SHOT_CLASSIFIER_WINDOW,
-        help="Frames each side of a hit to feed the shot classifier (roughly a full swing's worth at 30fps).",
-    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -409,8 +385,6 @@ def main(argv: list[str] | None = None) -> int:
         pose_confidence=args.pose_confidence, over_detect_poses=args.over_detect_poses,
         person_detector=args.person_detector, yolo_person_model_path=args.yolo_person_model,
         yolo_person_confidence=args.yolo_person_confidence, yolo_person_device=args.yolo_person_device,
-        shot_classifier_model_path=args.shot_classifier_model, shot_classifier_device=args.shot_classifier_device,
-        shot_classifier_window=args.shot_classifier_window,
     )
 
     write_shot_log(result.classifications, args.output_log)

@@ -23,14 +23,7 @@ import cv2
 
 from tennis_tracker.ball import BallDetection
 from tennis_tracker.calibration import CameraCalibration, calibrate_camera, load_correspondences_json
-from tennis_tracker.classify import (
-    DEFAULT_SHOT_CLASSIFIER_WINDOW,
-    MIN_SHOT_CLASSIFIER_FRAMES,
-    Handedness,
-    classify_pose,
-    nearest_player,
-    player_landmark_window,
-)
+from tennis_tracker.classify import Handedness, classify_pose, nearest_player
 from tennis_tracker.contact_fit import ContactEvent, fit_contact_event
 from tennis_tracker.physics import TennisBallParams
 from tennis_tracker.pipeline import BALL_DETECTORS, get_ball_detections, parse_handedness_arg
@@ -107,9 +100,6 @@ def run_physics_pipeline(
     yolo_person_model_path: str | None = None,
     yolo_person_confidence: float = 0.4,
     yolo_person_device: str = "cpu",
-    shot_classifier_model_path: str | Path | None = None,
-    shot_classifier_device: str = "cpu",
-    shot_classifier_window: int = DEFAULT_SHOT_CLASSIFIER_WINDOW,
 ) -> list[PhysicsShotResult]:
     frame_poses_list = list(track_poses(
         video_path, max_players=max_players, model_variant=pose_model_variant,
@@ -119,13 +109,6 @@ def run_physics_pipeline(
         yolo_confidence=yolo_person_confidence, yolo_device=yolo_person_device,
     ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
-
-    shot_classifier_model = None
-    if shot_classifier_model_path is not None:
-        # Imported lazily so not using this option never pulls in torch.
-        from tennis_tracker.shot_classifier import load_model as load_shot_classifier
-
-        shot_classifier_model = load_shot_classifier(shot_classifier_model_path, device=shot_classifier_device)
 
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -149,14 +132,7 @@ def run_physics_pipeline(
             player = nearest_player(hit.position, frame_poses)
             if player is not None:
                 player_id = player.player_id
-                if shot_classifier_model is not None:
-                    sequence = player_landmark_window(poses_by_frame, player_id, hit.frame_index, shot_classifier_window)
-                    if len(sequence) >= MIN_SHOT_CLASSIFIER_FRAMES:
-                        from tennis_tracker.shot_classifier import classify_landmarks_sequence
-
-                        shot_type, confidence = classify_landmarks_sequence(shot_classifier_model, sequence)
-                if shot_type is None:
-                    shot_type, confidence = classify_pose(player, handedness.get(player_id, "right"))
+                shot_type, confidence = classify_pose(player, handedness.get(player_id, "right"))
 
         pre_obs, post_obs = _build_hit_window(detections, hit, window_size, gap)
         if len(pre_obs) < min_observations or len(post_obs) < min_observations:
@@ -269,17 +245,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--yolo-person-confidence", type=float, default=0.4)
     parser.add_argument("--yolo-person-device", default="cpu", help='"cpu" or "cuda", for --person-detector yolo.')
-    parser.add_argument(
-        "--shot-classifier-model", default=None,
-        help="Trained shot-classifier checkpoint (from shot_classifier.py train). Replaces the geometric "
-        "forehand/backhand heuristic with a learned classifier that can distinguish more shot types, whenever "
-        "enough frames of the hitting player's pose are available around the hit.",
-    )
-    parser.add_argument("--shot-classifier-device", default="cpu", help='"cpu" or "cuda", for --shot-classifier-model.')
-    parser.add_argument(
-        "--shot-classifier-window", type=int, default=DEFAULT_SHOT_CLASSIFIER_WINDOW,
-        help="Frames each side of a hit to feed the shot classifier (roughly a full swing's worth at 30fps).",
-    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -302,8 +267,6 @@ def main(argv: list[str] | None = None) -> int:
         over_detect_poses=args.over_detect_poses,
         person_detector=args.person_detector, yolo_person_model_path=args.yolo_person_model,
         yolo_person_confidence=args.yolo_person_confidence, yolo_person_device=args.yolo_person_device,
-        shot_classifier_model_path=args.shot_classifier_model, shot_classifier_device=args.shot_classifier_device,
-        shot_classifier_window=args.shot_classifier_window,
     )
     write_physics_shot_log(results, args.output_log)
 

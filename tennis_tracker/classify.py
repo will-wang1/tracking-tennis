@@ -9,11 +9,6 @@ across the body to the opposite side. This needs each player's handedness
 two-handed backhand or a slice will confuse it, since it only looks at one
 wrist's side of the body, not full swing shape.
 
-classify_hits() can optionally use a trained tennis_tracker.shot_classifier
-model instead (see that module) — a THETIS-dataset-trained classifier that
-looks at a whole window of swing frames rather than one wrist's side, and
-can distinguish more shot types than just forehand/backhand/unclear. This
-heuristic remains the always-available default and fallback.
 """
 
 from __future__ import annotations
@@ -43,14 +38,6 @@ Handedness = str  # "right" or "left"
 
 
 NO_POSE_DATA = "no_pose_data"  # distinct from "unclear": no player/pose was found near the hit at all
-
-# Frames each side of a hit to gather for the THETIS-trained classifier
-# (tennis_tracker.shot_classifier) -- roughly a full swing's worth at 30fps.
-# Below MIN_SHOT_CLASSIFIER_FRAMES available frames (occlusion, a hit right
-# at the start/end of the clip), fall back to the geometric heuristic rather
-# than feed the classifier a near-empty sequence.
-DEFAULT_SHOT_CLASSIFIER_WINDOW = 15
-MIN_SHOT_CLASSIFIER_FRAMES = 4
 
 
 @dataclass
@@ -109,33 +96,11 @@ def classify_pose(player_pose: PlayerPose, handedness: Handedness) -> tuple[str,
     return ("forehand" if same_side_is_forehand > 0 else "backhand"), same_side_is_forehand
 
 
-def player_landmark_window(
-    poses_by_frame: dict[int, FramePoses], player_id: int, center_frame: int, window: int
-) -> list[np.ndarray]:
-    """Gather one player's landmarks across frames [center_frame - window, center_frame + window].
-
-    Frames where that player wasn't tracked are skipped rather than padded
-    here — extract_clip_features (tennis_tracker.shot_classifier) handles a
-    sequence shorter than its expected sample count.
-    """
-    sequence = []
-    for frame_index in range(center_frame - window, center_frame + window + 1):
-        frame_poses = poses_by_frame.get(frame_index)
-        if frame_poses is None:
-            continue
-        player = next((p for p in frame_poses.players if p.player_id == player_id), None)
-        if player is not None:
-            sequence.append(player.landmarks_px)
-    return sequence
-
-
 def classify_hits(
     hits: list[HitEvent],
     poses_by_frame: dict[int, FramePoses],
     handedness: dict[int, Handedness],
     max_frame_offset: int = 5,
-    shot_classifier_model=None,
-    shot_classifier_window: int = DEFAULT_SHOT_CLASSIFIER_WINDOW,
 ) -> list[ShotClassification]:
     """Classify each hit event using the nearest player's pose at (or near) that frame.
 
@@ -144,15 +109,6 @@ def classify_hits(
     at the moment of a fast swing) is reported as NO_POSE_DATA rather than
     silently dropped, so "N hits detected" and the classified-shot counts
     stay reconcilable instead of quietly disagreeing.
-
-    ``shot_classifier_model``, if given (a tennis_tracker.shot_classifier
-    ShotClassifierNet, e.g. from load_model()), is used in place of the
-    geometric heuristic whenever enough frames of that player's pose are
-    available around the hit — it can distinguish shot types the heuristic
-    can't (slices, two-handed backhands, volleys, serve types), depending
-    on what it was trained on. Falls back to the heuristic when no model is
-    given, or when too few frames are available (occlusion, a hit right at
-    a clip boundary).
     """
     results: list[ShotClassification] = []
 
@@ -165,15 +121,7 @@ def classify_hits(
             continue
 
         player_handedness = handedness.get(player.player_id, "right")
-        shot_type, confidence = None, None
-        if shot_classifier_model is not None:
-            sequence = player_landmark_window(poses_by_frame, player.player_id, hit.frame_index, shot_classifier_window)
-            if len(sequence) >= MIN_SHOT_CLASSIFIER_FRAMES:
-                from tennis_tracker.shot_classifier import classify_landmarks_sequence
-
-                shot_type, confidence = classify_landmarks_sequence(shot_classifier_model, sequence)
-        if shot_type is None:
-            shot_type, confidence = classify_pose(player, player_handedness)
+        shot_type, confidence = classify_pose(player, player_handedness)
 
         results.append(
             ShotClassification(hit=hit, player_id=player.player_id, shot_type=shot_type, confidence=confidence)
