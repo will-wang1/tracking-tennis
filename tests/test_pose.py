@@ -6,6 +6,7 @@ from tennis_tracker.pose import (
     PlayerPose,
     PlayerTracker,
     _detect_pose_in_crop,
+    _filter_by_court_polygon,
     _filter_to_most_active_tracks,
     _pad_and_clip_box,
     _yolo_person_boxes,
@@ -168,6 +169,56 @@ def test_filter_to_most_active_tracks_ignores_briefly_seen_track():
     all_ids = {p.player_id for fp in filtered for p in fp.players}
     assert 99 not in all_ids
     assert all_ids == {0, 1}
+
+
+# A simple square "court" in pixel space, for testing court-polygon filtering
+# without needing a real camera calibration.
+_COURT_POLYGON = np.array([[0, 0], [1000, 0], [1000, 1000], [0, 1000]], dtype=np.float32)
+
+
+def test_filter_by_court_polygon_drops_a_track_mostly_outside_it():
+    # Track 0 stays on-court the whole time; track 1 (a ball kid pacing by
+    # the fence, moving enough to fool the movement filter alone) stays
+    # entirely outside the court polygon.
+    frame_poses_list = [
+        _make_frame_poses(i, {0: (500, 500 + i), 1: (1500 + i * 5, 500)})
+        for i in range(10)
+    ]
+
+    filtered = _filter_by_court_polygon(frame_poses_list, _COURT_POLYGON)
+
+    all_ids = {p.player_id for fp in filtered for p in fp.players}
+    assert all_ids == {0}
+
+
+def test_filter_by_court_polygon_keeps_a_track_mostly_inside_it():
+    # Track spends 8/10 frames on-court and 2/10 briefly outside (e.g.
+    # chasing a wide ball past the sideline) -- above the default 50%
+    # threshold, so it must be kept, not penalized for a brief excursion.
+    tracks = {0: (500, 500)}
+    frame_poses_list = []
+    for i in range(10):
+        x = 1500 if i < 2 else 500  # outside court for the first 2 frames only
+        frame_poses_list.append(_make_frame_poses(i, {0: (x, 500)}))
+
+    filtered = _filter_by_court_polygon(frame_poses_list, _COURT_POLYGON)
+
+    all_ids = {p.player_id for fp in filtered for p in fp.players}
+    assert all_ids == {0}
+
+
+def test_filter_by_court_polygon_respects_custom_threshold():
+    # Same 2/10-outside track as above, but with a stricter 90% threshold
+    # it should now be dropped.
+    frame_poses_list = []
+    for i in range(10):
+        x = 1500 if i < 2 else 500
+        frame_poses_list.append(_make_frame_poses(i, {0: (x, 500)}))
+
+    filtered = _filter_by_court_polygon(frame_poses_list, _COURT_POLYGON, min_fraction_inside=0.9)
+
+    all_ids = {p.player_id for fp in filtered for p in fp.players}
+    assert all_ids == set()
 
 
 def test_draw_pose_overlay_skips_low_visibility_landmarks():

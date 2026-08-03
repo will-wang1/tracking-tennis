@@ -62,6 +62,15 @@ COURT_LANDMARKS: dict[str, tuple[float, float, float]] = {
 
 MIN_CALIBRATION_POINTS = 6
 
+# Real play routinely extends well beyond the doubles lines -- players stand
+# several meters behind the baseline to serve or return, and run wide past
+# the sideline for an angled shot -- so the raw court rectangle would wrongly
+# exclude real players. This margin defines a bigger "play area" rectangle
+# instead, generous enough to keep genuine play in bounds while still
+# excluding people clearly off to the side (ball kids, umpire chair,
+# spectators).
+DEFAULT_COURT_MARGIN_M = 6.0
+
 
 @dataclass
 class CameraCalibration:
@@ -162,6 +171,27 @@ def calibrate_camera(
         translation_vector=best_tvec.reshape(3),
         reprojection_error_px=best_error,
     )
+
+
+def court_boundary_polygon(calibration: CameraCalibration, margin_m: float = DEFAULT_COURT_MARGIN_M) -> np.ndarray:
+    """Project a court-plus-play-area rectangle (doubles lines expanded by ``margin_m``) into pixel coordinates.
+
+    Returns the 4 corners as an (4, 2) pixel-coordinate polygon, in order
+    (near-left, near-right, far-right, far-left) -- suitable for
+    cv2.pointPolygonTest or as tennis_tracker.pose.track_poses'
+    ``court_polygon_px`` argument.
+    """
+    half_length = _HALF_LENGTH + margin_m
+    half_width = _HALF_DOUBLES_WIDTH + margin_m
+    corners_world = np.array(
+        [
+            [-half_width, -half_length, 0.0],
+            [half_width, -half_length, 0.0],
+            [half_width, half_length, 0.0],
+            [-half_width, half_length, 0.0],
+        ]
+    )
+    return calibration.project(corners_world)
 
 
 def save_correspondences_json(correspondences: dict[str, tuple[float, float]], path: str | Path) -> None:

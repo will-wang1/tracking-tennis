@@ -4,7 +4,10 @@ import pytest
 
 from tennis_tracker.calibration import (
     COURT_LANDMARKS,
+    _HALF_DOUBLES_WIDTH,
+    _HALF_LENGTH,
     calibrate_camera,
+    court_boundary_polygon,
     load_correspondences_json,
     save_correspondences_json,
 )
@@ -97,3 +100,32 @@ def test_correspondences_json_round_trip(tmp_path):
     loaded = load_correspondences_json(path)
 
     assert loaded == correspondences
+
+
+def test_court_boundary_polygon_expands_with_margin():
+    cam_pos = np.array([0.0, -30.0, 7.0])
+    correspondences, _ = _synthetic_correspondences(
+        1100.0, 1100.0, 1280, 720, cam_pos, look_at=np.array([0.0, 0.0, 0.0])
+    )
+    calib = calibrate_camera(correspondences, (1280, 720))
+
+    no_margin = court_boundary_polygon(calib, margin_m=0.0)
+    with_margin = court_boundary_polygon(calib, margin_m=6.0)
+
+    assert no_margin.shape == (4, 2)
+    assert with_margin.shape == (4, 2)
+
+    # The zero-margin polygon's corners must exactly match the projected
+    # doubles-line corners; the actual net_center_ground landmark's known
+    # world position lets us sanity-check the projection is at least in the
+    # right place by re-deriving one corner directly.
+    expected_corner = calib.project(np.array([[-_HALF_DOUBLES_WIDTH, -_HALF_LENGTH, 0.0]]))[0]
+    np.testing.assert_allclose(no_margin[0], expected_corner, atol=0.5)
+
+    # With a margin, every corner should sit farther from the court center
+    # (in world space, which projecting preserves the ordering of for a
+    # camera looking roughly straight down the court) than the no-margin one.
+    center_px = calib.project(np.array([[0.0, 0.0, 0.0]]))[0]
+    no_margin_dists = np.linalg.norm(no_margin - center_px, axis=1)
+    with_margin_dists = np.linalg.norm(with_margin - center_px, axis=1)
+    assert np.all(with_margin_dists > no_margin_dists)

@@ -321,6 +321,44 @@ def _filter_to_most_active_tracks(frame_poses_list: list[FramePoses], max_player
     return filtered
 
 
+DEFAULT_MIN_FRACTION_INSIDE_COURT = 0.5
+
+
+def _filter_by_court_polygon(
+    frame_poses_list: list[FramePoses],
+    court_polygon_px: np.ndarray,
+    min_fraction_inside: float = DEFAULT_MIN_FRACTION_INSIDE_COURT,
+) -> list[FramePoses]:
+    """Drop tracks whose centroid sits outside ``court_polygon_px`` most of the time.
+
+    Complements _filter_to_most_active_tracks: a bystander who moves around
+    enough to fool the movement filter (an active ball kid, a pacing
+    umpire) is usually still standing off to the side of the court, which
+    this catches instead. ``court_polygon_px`` is expected to already
+    include a play-area margin beyond the technical court lines (see
+    tennis_tracker.calibration.court_boundary_polygon) since real players
+    routinely stand behind the baseline or run wide past the sideline.
+    """
+    polygon = court_polygon_px.astype(np.float32)
+    inside_counts: dict[int, list[bool]] = {}
+    for frame_poses in frame_poses_list:
+        for player in frame_poses.players:
+            centroid = tuple(float(v) for v in _centroid(player.landmarks_px))
+            inside = cv2.pointPolygonTest(polygon, centroid, False) >= 0
+            inside_counts.setdefault(player.player_id, []).append(inside)
+
+    keep_ids = {
+        track_id for track_id, insides in inside_counts.items()
+        if sum(insides) / len(insides) >= min_fraction_inside
+    }
+
+    filtered: list[FramePoses] = []
+    for frame_poses in frame_poses_list:
+        players = [p for p in frame_poses.players if p.player_id in keep_ids]
+        filtered.append(FramePoses(frame_index=frame_poses.frame_index, timestamp=frame_poses.timestamp, players=players))
+    return filtered
+
+
 def track_poses(
     video_path: str | Path,
     max_players: int = 2,
@@ -336,6 +374,8 @@ def track_poses(
     yolo_confidence: float = 0.4,
     yolo_device: str = "cpu",
     yolo_crop_padding: float = YOLO_CROP_PADDING_FRAC,
+    court_polygon_px: np.ndarray | None = None,
+    min_fraction_inside_court: float = DEFAULT_MIN_FRACTION_INSIDE_COURT,
 ):
     """Yield a FramePoses per video frame, with player IDs stable across frames.
 
@@ -360,6 +400,13 @@ def track_poses(
     small/distant in a wide broadcast-angle shot — a whole-frame detector
     like mediapipe's shrinks them further just to fit its input, while a
     per-person crop keeps them filling it.
+
+    ``court_polygon_px``, if given (e.g. from
+    tennis_tracker.calibration.court_boundary_polygon), drops any track
+    whose centroid sits outside it more than ``1 - min_fraction_inside_court``
+    of the time — a bystander who moves enough to fool the movement filter
+    above (an active ball kid, a pacing umpire) is usually still standing
+    off to the side of the court, which position catches instead.
     """
     if person_detector not in PERSON_DETECTORS:
         raise ValueError(f"Unknown person_detector {person_detector!r}; choose from {PERSON_DETECTORS}")
@@ -448,6 +495,9 @@ def track_poses(
         if verbose and frame_index:
             print()  # newline after the live-updating progress line
 
+    if court_polygon_px is not None:
+        raw_frames = _filter_by_court_polygon(raw_frames, court_polygon_px, min_fraction_inside_court)
+
     yield from _filter_to_most_active_tracks(raw_frames, max_players)
 
 
@@ -522,6 +572,7 @@ def visualize(
     yolo_model_path: str | None = None,
     yolo_confidence: float = 0.4,
     yolo_device: str = "cpu",
+    court_polygon_px: np.ndarray | None = None,
 ) -> int:
     """Write an annotated copy of ``video_path`` with skeleton overlays to ``output_path``."""
     cap = cv2.VideoCapture(str(video_path))
@@ -543,7 +594,7 @@ def visualize(
             min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
             min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
             person_detector=person_detector, yolo_model_path=yolo_model_path,
-            yolo_confidence=yolo_confidence, yolo_device=yolo_device,
+            yolo_confidence=yolo_confidence, yolo_device=yolo_device, court_polygon_px=court_polygon_px,
         ):
             ok, frame = cap.read()
             if not ok:
@@ -595,16 +646,39 @@ def main(argv: list[str] | None = None) -> int:
     )
     viz_p.add_argument("--yolo-confidence", type=float, default=0.4)
     viz_p.add_argument("--yolo-device", default="cpu", help='"cpu" or "cuda", for --person-detector yolo.')
+    viz_p.add_argument(
+        "--calibration-json", default=None,
+        help="Court landmark correspondences JSON (from calibration.py collect/solve). When given, drops any "
+        "track that spends most of its time outside the court + play-area boundary -- catches bystanders "
+        "(ball kids, umpire, linespeople) who move enough to fool the movement-based filter.",
+    )
+    viz_p.add_argument(
+        "--court-margin-m", type=float, default=None,
+        help="Meters beyond the doubles lines still counted as in-bounds (default: calibration.py's own default).",
+    )
 
     args = parser.parse_args(argv)
 
     if args.command == "visualize":
+        court_polygon_px = None
+        if args.calibration_json:
+            from tennis_tracker.calibration import calibrate_camera, court_boundary_polygon, load_correspondences_json
+
+            cap = cv2.VideoCapture(args.video)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            correspondences = load_correspondences_json(args.calibration_json)
+            calibration = calibrate_camera(correspondences, (width, height))
+            margin_kwargs = {"margin_m": args.court_margin_m} if args.court_margin_m is not None else {}
+            court_polygon_px = court_boundary_polygon(calibration, **margin_kwargs)
+
         count = visualize(
             args.video, args.output_video, max_players=args.max_players,
             model_variant=args.model_variant, pose_confidence=args.pose_confidence,
             over_detect_poses=args.over_detect_poses, min_landmark_visibility=args.min_landmark_visibility,
             person_detector=args.person_detector, yolo_model_path=args.yolo_model,
-            yolo_confidence=args.yolo_confidence, yolo_device=args.yolo_device,
+            yolo_confidence=args.yolo_confidence, yolo_device=args.yolo_device, court_polygon_px=court_polygon_px,
         )
         print(f"Wrote {count} annotated frames to {args.output_video}")
         return 0

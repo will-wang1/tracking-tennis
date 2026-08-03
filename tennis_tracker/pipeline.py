@@ -154,6 +154,7 @@ def run_pipeline(
     shot_classifier_model_path: str | Path | None = None,
     shot_classifier_device: str = "cpu",
     shot_classifier_window: int = DEFAULT_SHOT_CLASSIFIER_WINDOW,
+    court_polygon_px: np.ndarray | None = None,
     verbose: bool = True,
 ) -> PipelineResult:
     """Run pose tracking, ball tracking, hit detection, and classification over a video.
@@ -171,7 +172,7 @@ def run_pipeline(
         min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
         min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses, verbose=verbose,
         person_detector=person_detector, yolo_model_path=yolo_person_model_path,
-        yolo_confidence=yolo_person_confidence, yolo_device=yolo_person_device,
+        yolo_confidence=yolo_person_confidence, yolo_device=yolo_person_device, court_polygon_px=court_polygon_px,
     ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
@@ -391,6 +392,16 @@ def main(argv: list[str] | None = None) -> int:
         "--shot-classifier-window", type=int, default=DEFAULT_SHOT_CLASSIFIER_WINDOW,
         help="Frames each side of a hit to feed the shot classifier (roughly a full swing's worth at 30fps).",
     )
+    parser.add_argument(
+        "--calibration-json", default=None,
+        help="Court landmark correspondences JSON (from calibration.py collect/solve). When given, drops any "
+        "pose track that spends most of its time outside the court + play-area boundary -- catches bystanders "
+        "(ball kids, umpire, linespeople) who move enough to fool the movement-based filter alone.",
+    )
+    parser.add_argument(
+        "--court-margin-m", type=float, default=None,
+        help="Meters beyond the doubles lines still counted as in-bounds (default: calibration.py's own default).",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -399,6 +410,20 @@ def main(argv: list[str] | None = None) -> int:
         ball_detector_kwargs["hsv_lower"] = tuple(int(v) for v in args.ball_hsv_lower.split(","))
     if args.ball_hsv_upper:
         ball_detector_kwargs["hsv_upper"] = tuple(int(v) for v in args.ball_hsv_upper.split(","))
+
+    court_polygon_px = None
+    if args.calibration_json:
+        from tennis_tracker.calibration import calibrate_camera, court_boundary_polygon, load_correspondences_json
+
+        cap = cv2.VideoCapture(args.video)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        correspondences = load_correspondences_json(args.calibration_json)
+        calibration = calibrate_camera(correspondences, (width, height))
+        margin_kwargs = {"margin_m": args.court_margin_m} if args.court_margin_m is not None else {}
+        court_polygon_px = court_boundary_polygon(calibration, **margin_kwargs)
+        print(f"Calibration reprojection error: {calibration.reprojection_error_px:.2f} px")
 
     result = run_pipeline(
         args.video, handedness, max_players=args.max_players, ball_detector_kwargs=ball_detector_kwargs,
@@ -410,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         person_detector=args.person_detector, yolo_person_model_path=args.yolo_person_model,
         yolo_person_confidence=args.yolo_person_confidence, yolo_person_device=args.yolo_person_device,
         shot_classifier_model_path=args.shot_classifier_model, shot_classifier_device=args.shot_classifier_device,
-        shot_classifier_window=args.shot_classifier_window,
+        shot_classifier_window=args.shot_classifier_window, court_polygon_px=court_polygon_px,
     )
 
     write_shot_log(result.classifications, args.output_log)

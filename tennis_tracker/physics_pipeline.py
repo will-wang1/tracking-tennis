@@ -22,7 +22,13 @@ from pathlib import Path
 import cv2
 
 from tennis_tracker.ball import BallDetection
-from tennis_tracker.calibration import CameraCalibration, calibrate_camera, load_correspondences_json
+from tennis_tracker.calibration import (
+    DEFAULT_COURT_MARGIN_M,
+    CameraCalibration,
+    calibrate_camera,
+    court_boundary_polygon,
+    load_correspondences_json,
+)
 from tennis_tracker.classify import (
     DEFAULT_SHOT_CLASSIFIER_WINDOW,
     MIN_SHOT_CLASSIFIER_FRAMES,
@@ -110,13 +116,21 @@ def run_physics_pipeline(
     shot_classifier_model_path: str | Path | None = None,
     shot_classifier_device: str = "cpu",
     shot_classifier_window: int = DEFAULT_SHOT_CLASSIFIER_WINDOW,
+    apply_court_filter: bool = True,
+    court_margin_m: float = DEFAULT_COURT_MARGIN_M,
 ) -> list[PhysicsShotResult]:
+    # A CameraCalibration is already required here (for the physics fit
+    # itself), so -- unlike pipeline.py, where calibration is optional --
+    # court-boundary filtering can just be on by default: it's free given
+    # what this function already needs.
+    court_polygon_px = court_boundary_polygon(calibration, margin_m=court_margin_m) if apply_court_filter else None
+
     frame_poses_list = list(track_poses(
         video_path, max_players=max_players, model_variant=pose_model_variant,
         min_pose_detection_confidence=pose_confidence, min_pose_presence_confidence=pose_confidence,
         min_tracking_confidence=pose_confidence, over_detect_poses=over_detect_poses,
         person_detector=person_detector, yolo_model_path=yolo_person_model_path,
-        yolo_confidence=yolo_person_confidence, yolo_device=yolo_person_device,
+        yolo_confidence=yolo_person_confidence, yolo_device=yolo_person_device, court_polygon_px=court_polygon_px,
     ))
     poses_by_frame = {fp.frame_index: fp for fp in frame_poses_list}
 
@@ -280,6 +294,15 @@ def main(argv: list[str] | None = None) -> int:
         "--shot-classifier-window", type=int, default=DEFAULT_SHOT_CLASSIFIER_WINDOW,
         help="Frames each side of a hit to feed the shot classifier (roughly a full swing's worth at 30fps).",
     )
+    parser.add_argument(
+        "--no-court-filter", action="store_true",
+        help="Disable court-boundary filtering (on by default here, since calibration is already required). "
+        "Drops pose tracks that spend most of their time outside the court + play-area boundary.",
+    )
+    parser.add_argument(
+        "--court-margin-m", type=float, default=DEFAULT_COURT_MARGIN_M,
+        help="Meters beyond the doubles lines still counted as in-bounds.",
+    )
     args = parser.parse_args(argv)
 
     handedness = parse_handedness_arg(args.handedness)
@@ -304,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         yolo_person_confidence=args.yolo_person_confidence, yolo_person_device=args.yolo_person_device,
         shot_classifier_model_path=args.shot_classifier_model, shot_classifier_device=args.shot_classifier_device,
         shot_classifier_window=args.shot_classifier_window,
+        apply_court_filter=not args.no_court_filter, court_margin_m=args.court_margin_m,
     )
     write_physics_shot_log(results, args.output_log)
 
