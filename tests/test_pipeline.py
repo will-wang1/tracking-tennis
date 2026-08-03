@@ -93,7 +93,7 @@ def test_get_ball_detections_tracknet(tmp_path):
     video_path = tmp_path / "clip.mp4"
     _write_synthetic_ball_video(video_path)
     model_path = tmp_path / "model.pt"
-    save_model(TrackNet(num_frames=3), model_path)
+    save_model(TrackNet(input_size=(64, 48)), model_path)
 
     detections = get_ball_detections(video_path, detector="tracknet", tracknet_model_path=model_path)
 

@@ -1,32 +1,47 @@
 """Phase E: TrackNet-style temporal CNN for ball detection.
 
-This is a from-scratch, simplified reimplementation of the TrackNetV2-style
-architecture — a VGG-like encoder/decoder that takes several consecutive
-frames stacked on the channel axis and outputs one heatmap per input frame.
-Using multiple frames at once (rather than one frame in isolation) is what
-lets it see through motion blur: a fast-moving ball leaves a trail of
-appearance across frames that a single-frame detector can't use.
+This ports yastrebksv/TrackNet (https://github.com/yastrebksv/TrackNet) -- a
+proven, published PyTorch implementation of TrackNetV2 built for this exact
+tennis dataset format -- in place of the from-scratch simplified
+architecture this module used before. The two differ in a few consequential
+ways:
 
-Training data is the standard TrackNet tennis dataset layout: a root
+- Input: the current frame plus its two predecessors stacked on the channel
+  axis (9 channels), newest first. Multiple frames at once is what lets the
+  model see through motion blur -- a fast ball leaves a trail of appearance
+  across frames a single-frame detector can't use.
+- Output/loss: rather than regressing a [0,1] heatmap per input frame
+  (sigmoid + BCE), the model predicts, independently per pixel, which of 256
+  grayscale intensity classes (0-255) that pixel's Gaussian heatmap value
+  falls into (softmax classification + cross-entropy) -- a single heatmap,
+  for only the *current* (most recent) of the stacked frames.
+- Postprocessing: rather than taking the single brightest pixel, the
+  predicted class map is thresholded to binary and searched for a circular
+  blob via Hough circle detection. This rejects non-circular bright regions
+  (a common false-positive shape for a small, fast, motion-blurred ball)
+  that plain argmax can't distinguish from the real thing.
+
+This is an architecture change, not a compatible extension: a checkpoint
+trained with the previous version of this module cannot be loaded here and
+must be retrained (see train() below) -- load_model() checks for this and
+raises a clear error rather than failing cryptically.
+
+Training data is still the standard TrackNet tennis dataset layout: a root
 directory of game1/, game2/, ... folders, each containing Clip1/, Clip2/,
 ... folders, each holding sequential frame images (0000.jpg, 0001.jpg, ...)
 plus a Label.csv with one row per frame: file name, visibility class (0=ball
 not in frame, 1=clearly visible, 2=hard to see, 3=occluded), x/y pixel
-coordinate, and trajectory pattern (0=flying, 1=hit, 2=bouncing — recorded
+coordinate, and trajectory pattern (0=flying, 1=hit, 2=bouncing -- recorded
 here but not consumed by this model; hit/bounce detection is handled
 separately by tennis_tracker.trajectory and tennis_tracker.contact_fit).
 
 Windows never cross a Clip boundary, since each clip is an independent
-rally — frame 0000 of Clip2 has nothing to do with the last frame of Clip1.
+rally -- frame 0000 of Clip2 has nothing to do with the last frame of Clip1.
 
-There are no pretrained weights bundled here — see the project's earlier
-discussion for why: third-party pretrained checkpoints for this exact task
-are typically distributed as ad-hoc pickled files of uncertain provenance,
-a real code-execution risk to load blindly. Once you've trained a model
-with train() below, run_tracknet_on_video() analyzes a real video the same
-way tennis_tracker.ball.detect_video() does — same per-frame generator
-contract — so a trained model is a drop-in alternative to the classical
-detector.
+Once you've trained a model with train() below, run_tracknet_on_video()
+analyzes a real video the same way tennis_tracker.ball.detect_video() does
+-- same per-frame generator contract -- so a trained model is a drop-in
+alternative to the classical detector.
 """
 
 from __future__ import annotations
@@ -45,10 +60,25 @@ from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from tennis_tracker.ball import BallDetection
 
-DEFAULT_NUM_FRAMES = 3
-DEFAULT_INPUT_SIZE = (512, 288)  # (width, height), matches the published TrackNetV2 setup
-DEFAULT_HEATMAP_SIGMA = 5.0
-DEFAULT_CONFIDENCE_THRESHOLD = 0.5
+NUM_FRAMES = 3  # fixed by the architecture: 3 stacked RGB frames = 9 input channels
+NUM_HEATMAP_CLASSES = 256  # per-pixel grayscale intensity classes (0-255) -- the classification target
+ARCHITECTURE_VERSION = "yastrebksv-v1"
+
+# (width, height); both divisible by 8 for clean pool/upsample. The reference
+# implementation defaults to 640x360 -- pass that explicitly via
+# --input-width/--input-height for literal fidelity. This module defaults
+# smaller since the 256-class output head is already more VRAM-hungry than
+# plain heatmap regression, and this repo's known training GPU (4GB) is
+# tight on memory.
+DEFAULT_INPUT_SIZE = (512, 288)
+DEFAULT_GAUSSIAN_KERNEL_SIZE = 20  # ground-truth Gaussian half-width, in native-resolution pixels
+DEFAULT_GAUSSIAN_VARIANCE = 10.0
+
+DEFAULT_BINARY_THRESHOLD = 127  # argmax class map -> binary mask cutoff, before Hough circle detection
+DEFAULT_HOUGH_PARAM1 = 50.0
+DEFAULT_HOUGH_PARAM2 = 2.0  # very low accumulator threshold -- the ball is a weak, small circular blob
+DEFAULT_MIN_RADIUS = 2
+DEFAULT_MAX_RADIUS = 7
 
 _FILE_NAME_ALIASES = ["file name", "filename", "file_name", "file"]
 _VISIBILITY_ALIASES = ["visibility class", "visibility", "vc", "visibility_class"]
@@ -58,12 +88,19 @@ _TRAJECTORY_ALIASES = ["trajectory pattern", "trajectory", "status", "trajectory
 
 
 class _ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+    """Conv2d -> ReLU -> BatchNorm2d, in that order.
+
+    Matches yastrebksv/TrackNet's ConvBlock exactly -- an unusual order
+    (ReLU before BatchNorm rather than after), not just a generic conv block,
+    kept as-is for fidelity to the reference implementation.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, padding: int = 1):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding),
+            nn.ReLU(),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -71,59 +108,162 @@ class _ConvBlock(nn.Module):
 
 
 class TrackNet(nn.Module):
-    """VGG-style encoder/decoder producing one heatmap per input frame."""
+    """VGG-style encoder/decoder, ported from yastrebksv/TrackNet's BallTrackerNet.
 
-    def __init__(self, num_frames: int = DEFAULT_NUM_FRAMES, channels_per_frame: int = 3):
+    Outputs, per pixel, a distribution over NUM_HEATMAP_CLASSES (0-255)
+    grayscale intensity classes for a single heatmap (the current/most
+    recent of the NUM_FRAMES stacked input frames) -- reshaped to
+    (batch, 256, H*W) for nn.CrossEntropyLoss. Fully convolutional (pooled
+    3x by 2x, then upsampled 3x by 2x -- net effect: input resolution is
+    preserved), so it works at any input resolution divisible by 8, not just
+    the reference's 640x360. ``input_size`` isn't used inside the network
+    itself; it's just carried along so save_model/load_model can round-trip
+    the resolution a checkpoint was trained at, so inference automatically
+    matches without the caller needing to remember and repass it.
+    """
+
+    def __init__(self, input_size: tuple[int, int] = DEFAULT_INPUT_SIZE):
         super().__init__()
-        self.num_frames = num_frames
-        in_channels = num_frames * channels_per_frame
+        self.input_size = input_size
+        in_channels = NUM_FRAMES * 3
 
-        self.enc1 = nn.Sequential(_ConvBlock(in_channels, 64), _ConvBlock(64, 64))
-        self.pool1 = nn.MaxPool2d(2)
-        self.enc2 = nn.Sequential(_ConvBlock(64, 128), _ConvBlock(128, 128))
-        self.pool2 = nn.MaxPool2d(2)
-        self.enc3 = nn.Sequential(_ConvBlock(128, 256), _ConvBlock(256, 256), _ConvBlock(256, 256))
-        self.pool3 = nn.MaxPool2d(2)
-        self.bottleneck = nn.Sequential(_ConvBlock(256, 512), _ConvBlock(512, 512), _ConvBlock(512, 512))
+        self.conv1 = _ConvBlock(in_channels, 64)
+        self.conv2 = _ConvBlock(64, 64)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv3 = _ConvBlock(64, 128)
+        self.conv4 = _ConvBlock(128, 128)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv5 = _ConvBlock(128, 256)
+        self.conv6 = _ConvBlock(256, 256)
+        self.conv7 = _ConvBlock(256, 256)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv8 = _ConvBlock(256, 512)
+        self.conv9 = _ConvBlock(512, 512)
+        self.conv10 = _ConvBlock(512, 512)
+        self.ups1 = nn.Upsample(scale_factor=2)
+        self.conv11 = _ConvBlock(512, 256)
+        self.conv12 = _ConvBlock(256, 256)
+        self.conv13 = _ConvBlock(256, 256)
+        self.ups2 = nn.Upsample(scale_factor=2)
+        self.conv14 = _ConvBlock(256, 128)
+        self.conv15 = _ConvBlock(128, 128)
+        self.ups3 = nn.Upsample(scale_factor=2)
+        self.conv16 = _ConvBlock(128, 64)
+        self.conv17 = _ConvBlock(64, 64)
+        self.conv18 = _ConvBlock(64, NUM_HEATMAP_CLASSES)
 
-        self.up3 = nn.Upsample(scale_factor=2, mode="nearest")
-        self.dec3 = nn.Sequential(_ConvBlock(512, 256), _ConvBlock(256, 256), _ConvBlock(256, 256))
-        self.up2 = nn.Upsample(scale_factor=2, mode="nearest")
-        self.dec2 = nn.Sequential(_ConvBlock(256, 128), _ConvBlock(128, 128))
-        self.up1 = nn.Upsample(scale_factor=2, mode="nearest")
-        self.dec1 = nn.Sequential(_ConvBlock(128, 64), _ConvBlock(64, 64))
+        self.softmax = nn.Softmax(dim=1)
+        self._init_weights()
 
-        self.output_conv = nn.Conv2d(64, num_frames, kernel_size=1)
+    def forward(self, x: torch.Tensor, testing: bool = False) -> torch.Tensor:
+        """Returns raw per-pixel class logits reshaped to (batch, 256, H*W).
 
-    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Raw pre-sigmoid output. Training uses this + BCEWithLogitsLoss, which is
-        numerically stable and autocast-safe, unlike computing sigmoid then BCELoss
-        separately (fp16 can round a sigmoid output infinitesimally outside [0, 1],
-        which CUDA's BCELoss kernel then rejects with a hard assertion failure)."""
-        x = self.pool1(self.enc1(x))
-        x = self.pool2(self.enc2(x))
-        x = self.pool3(self.enc3(x))
-        x = self.bottleneck(x)
-        x = self.dec3(self.up3(x))
-        x = self.dec2(self.up2(x))
-        x = self.dec1(self.up1(x))
-        return self.output_conv(x)
+        Training feeds this straight into nn.CrossEntropyLoss (which applies
+        log-softmax internally). ``testing=True`` additionally applies
+        softmax, turning the output into per-class probabilities -- plain
+        inference doesn't need this, since argmax of logits and argmax of
+        softmax(logits) always agree.
+        """
+        batch_size = x.size(0)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.pool1(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.pool2(x)
+        x = self.conv5(x)
+        x = self.conv6(x)
+        x = self.conv7(x)
+        x = self.pool3(x)
+        x = self.conv8(x)
+        x = self.conv9(x)
+        x = self.conv10(x)
+        x = self.ups1(x)
+        x = self.conv11(x)
+        x = self.conv12(x)
+        x = self.conv13(x)
+        x = self.ups2(x)
+        x = self.conv14(x)
+        x = self.conv15(x)
+        x = self.ups3(x)
+        x = self.conv16(x)
+        x = self.conv17(x)
+        x = self.conv18(x)
+        out = x.reshape(batch_size, NUM_HEATMAP_CLASSES, -1)
+        if testing:
+            out = self.softmax(out)
+        return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.forward_logits(x))
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.uniform_(module.weight, -0.05, 0.05)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
 
 
-def generate_heatmap(x: float, y: float, height: int, width: int, sigma: float = DEFAULT_HEATMAP_SIGMA) -> np.ndarray:
-    """A 2D Gaussian heatmap peaking at (x, y), used as the training target for one frame."""
-    yy, xx = np.mgrid[0:height, 0:width]
-    heatmap = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2))
-    return heatmap.astype(np.float32)
+def generate_heatmap_classes(
+    x: float | None,
+    y: float | None,
+    orig_width: int,
+    orig_height: int,
+    target_width: int,
+    target_height: int,
+    kernel_size: int = DEFAULT_GAUSSIAN_KERNEL_SIZE,
+    variance: float = DEFAULT_GAUSSIAN_VARIANCE,
+) -> np.ndarray:
+    """Render the ball's ground-truth Gaussian heatmap at native resolution, then
+    downsample to the model's working resolution -- matches yastrebksv/TrackNet's
+    gt_gen.py exactly. Returns per-pixel *class labels* (0-255 grayscale
+    intensity), the nn.CrossEntropyLoss target -- not a [0, 1] regression target.
+    """
+    heatmap = np.zeros((orig_height, orig_width), dtype=np.uint8)
+    if x is not None and y is not None:
+        xi, yi = int(x), int(y)
+        for i in range(-kernel_size, kernel_size + 1):
+            px = xi + i
+            if px < 0 or px >= orig_width:
+                continue
+            for j in range(-kernel_size, kernel_size + 1):
+                py = yi + j
+                if py < 0 or py >= orig_height:
+                    continue
+                value = int(255 * np.exp(-(i**2 + j**2) / (2 * variance)))
+                if value > 0:
+                    heatmap[py, px] = value
+    return cv2.resize(heatmap, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
 
 
-def heatmap_to_position(heatmap: np.ndarray) -> tuple[float, float]:
-    """Argmax of a predicted heatmap, as an (x, y) pixel position in that heatmap's own resolution."""
-    y, x = np.unravel_index(np.argmax(heatmap), heatmap.shape)
-    return float(x), float(y)
+def postprocess_heatmap(
+    class_map: np.ndarray,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+    binary_threshold: int = DEFAULT_BINARY_THRESHOLD,
+    hough_param1: float = DEFAULT_HOUGH_PARAM1,
+    hough_param2: float = DEFAULT_HOUGH_PARAM2,
+    min_radius: int = DEFAULT_MIN_RADIUS,
+    max_radius: int = DEFAULT_MAX_RADIUS,
+) -> tuple[tuple[float, float] | None, float | None]:
+    """Threshold the predicted per-pixel class map to binary, then find a circular
+    blob via Hough circle detection -- yastrebksv/TrackNet's postprocessing
+    exactly, chosen over plain argmax-of-heatmap because it rejects
+    non-circular bright regions (a common false-positive shape for a small,
+    blurry, fast-moving ball) rather than just taking whichever pixel scored
+    highest.
+    """
+    frame = class_map.astype(np.uint8)
+    _, binary = cv2.threshold(frame, binary_threshold, 255, cv2.THRESH_BINARY)
+    circles = cv2.HoughCircles(
+        binary, cv2.HOUGH_GRADIENT, dp=1, minDist=1,
+        param1=hough_param1, param2=hough_param2, minRadius=min_radius, maxRadius=max_radius,
+    )
+    if circles is None:
+        return None, None
+    x, y, radius = circles[0][0]
+    return (float(x) * scale_x, float(y) * scale_y), float(radius) * ((scale_x + scale_y) / 2)
 
 
 @dataclass
@@ -181,24 +321,26 @@ def load_label_csv(path: str | Path) -> list[FrameLabel]:
 class ClipFrameDataset(Dataset):
     """One Clip*/ folder: sequential frame images + Label.csv, from the TrackNet dataset.
 
-    Windows of ``num_frames`` consecutive frames are built entirely within
-    this clip. Frames labeled visibility_class=0 (ball not in frame) get an
-    all-zero heatmap target rather than being skipped — training the model
-    to predict "no ball here" is itself useful signal, not something to
-    discard.
+    Each item is a window of NUM_FRAMES=3 consecutive frames (never crossing
+    a clip boundary), stacked newest-first on the channel axis, with the
+    *current* (most recent) frame's ball position as the target heatmap.
+    Frames labeled visibility_class=0 (ball not in frame) get an all-zero
+    (class 0 everywhere) heatmap target rather than being skipped --
+    training the model to predict "no ball here" is itself useful signal,
+    not something to discard.
     """
 
     def __init__(
         self,
         clip_dir: str | Path,
-        num_frames: int = DEFAULT_NUM_FRAMES,
         input_size: tuple[int, int] = DEFAULT_INPUT_SIZE,
-        heatmap_sigma: float = DEFAULT_HEATMAP_SIGMA,
+        gaussian_kernel_size: int = DEFAULT_GAUSSIAN_KERNEL_SIZE,
+        gaussian_variance: float = DEFAULT_GAUSSIAN_VARIANCE,
     ):
         self.clip_dir = Path(clip_dir)
-        self.num_frames = num_frames
         self.input_size = input_size
-        self.heatmap_sigma = heatmap_sigma
+        self.gaussian_kernel_size = gaussian_kernel_size
+        self.gaussian_variance = gaussian_variance
 
         label_path = self.clip_dir / "Label.csv"
         if not label_path.exists():
@@ -217,35 +359,38 @@ class ClipFrameDataset(Dataset):
         self.orig_height, self.orig_width = first_frame.shape[:2]
 
     def __len__(self) -> int:
-        return max(0, len(self.labels) - self.num_frames + 1)
+        return max(0, len(self.labels) - (NUM_FRAMES - 1))
+
+    def _load_resized(self, file_name: str) -> np.ndarray:
+        width, height = self.input_size
+        frame = cv2.imread(str(self.clip_dir / file_name))
+        if frame is None:
+            raise RuntimeError(f"Could not read frame image: {self.clip_dir / file_name}")
+        return cv2.resize(frame, (width, height))
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        current = self.labels[idx + NUM_FRAMES - 1]
+        prev = self.labels[idx + NUM_FRAMES - 2]
+        preprev = self.labels[idx]
+
+        # Newest-first channel order, matching yastrebksv/TrackNet's own
+        # dataset -- the exact convention doesn't matter on its own, but
+        # run_tracknet_on_video() must stack frames the same way at
+        # inference as training does here.
+        img = self._load_resized(current.file_name)
+        img_prev = self._load_resized(prev.file_name)
+        img_preprev = self._load_resized(preprev.file_name)
+        stacked = np.concatenate((img, img_prev, img_preprev), axis=2).astype(np.float32) / 255.0
+        stacked = np.rollaxis(stacked, 2, 0)  # HWC -> CHW
+
         width, height = self.input_size
-        scale_x = width / self.orig_width
-        scale_y = height / self.orig_height
+        heatmap_classes = generate_heatmap_classes(
+            current.x, current.y, self.orig_width, self.orig_height, width, height,
+            kernel_size=self.gaussian_kernel_size, variance=self.gaussian_variance,
+        )
+        target = heatmap_classes.astype(np.int64).reshape(-1)
 
-        frame_tensors = []
-        heatmaps = []
-        for i in range(self.num_frames):
-            label = self.labels[idx + i]
-            frame_path = self.clip_dir / label.file_name
-            frame = cv2.imread(str(frame_path))
-            if frame is None:
-                raise RuntimeError(f"Could not read frame image: {frame_path}")
-            frame = cv2.resize(frame, (width, height))
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-            frame_tensors.append(frame_rgb.transpose(2, 0, 1))  # HWC -> CHW
-
-            if label.x is None or label.y is None:
-                heatmaps.append(np.zeros((height, width), dtype=np.float32))
-            else:
-                heatmaps.append(
-                    generate_heatmap(label.x * scale_x, label.y * scale_y, height, width, self.heatmap_sigma)
-                )
-
-        stacked_frames = np.concatenate(frame_tensors, axis=0)  # (num_frames*3, H, W)
-        stacked_heatmaps = np.stack(heatmaps, axis=0)  # (num_frames, H, W)
-        return torch.from_numpy(stacked_frames), torch.from_numpy(stacked_heatmaps)
+        return torch.from_numpy(stacked), torch.from_numpy(target)
 
 
 def find_clip_directories(
@@ -277,14 +422,14 @@ def build_dataset_from_root(
     dataset_root: str | Path,
     games: list[int] | None = None,
     max_clips_per_game: int | None = None,
-    num_frames: int = DEFAULT_NUM_FRAMES,
     input_size: tuple[int, int] = DEFAULT_INPUT_SIZE,
-    heatmap_sigma: float = DEFAULT_HEATMAP_SIGMA,
+    gaussian_kernel_size: int = DEFAULT_GAUSSIAN_KERNEL_SIZE,
+    gaussian_variance: float = DEFAULT_GAUSSIAN_VARIANCE,
 ) -> ConcatDataset:
     """Builds one combined Dataset spanning every Clip*/ folder found under dataset_root/game*/.
 
     ``games`` restricts to specific game numbers (e.g. [1, 2]); omit for all
-    10. ``max_clips_per_game`` caps clips per game — handy for a quick smoke
+    10. ``max_clips_per_game`` caps clips per game -- handy for a quick smoke
     run rather than loading all ~20k frames.
     """
     clip_dirs = find_clip_directories(dataset_root, games=games, max_clips_per_game=max_clips_per_game)
@@ -292,7 +437,9 @@ def build_dataset_from_root(
         raise FileNotFoundError(f"No game*/Clip* directories found under {dataset_root}")
 
     clip_datasets = [
-        ClipFrameDataset(d, num_frames=num_frames, input_size=input_size, heatmap_sigma=heatmap_sigma)
+        ClipFrameDataset(
+            d, input_size=input_size, gaussian_kernel_size=gaussian_kernel_size, gaussian_variance=gaussian_variance,
+        )
         for d in clip_dirs
     ]
     clip_datasets = [d for d in clip_datasets if len(d) > 0]
@@ -316,9 +463,14 @@ def train(
 ) -> list[float]:
     """Trains ``model`` in place; returns the per-epoch mean loss history.
 
+    Loss is nn.CrossEntropyLoss over the 256 per-pixel grayscale-intensity
+    classes (see TrackNet.forward's docstring) -- this pairs well with
+    mixed-precision training (no special fp16/autocast workaround needed,
+    unlike the sigmoid+BCE setup this module used before).
+
     ``progress_callback``, if given, is called after every batch as
     ``progress_callback(epoch, batch_index, num_batches, batch_loss)`` (all
-    1-indexed except epoch) — a full training run can have thousands of
+    1-indexed except epoch) -- a full training run can have thousands of
     batches, so this is what lets a CLI show live progress instead of a
     blank terminal for however long the run takes.
 
@@ -326,21 +478,18 @@ def train(
     worker processes while the GPU computes on the current batch, instead of
     stalling on disk I/O between every batch. Every input in this dataset is
     the same fixed size, so cuDNN's autotuner (enabled below) can pick the
-    fastest convolution algorithm for that shape once and reuse it — on CUDA
+    fastest convolution algorithm for that shape once and reuse it -- on CUDA
     this is normally a large speedup for a fixed-input-size CNN like this one.
 
     ``use_amp`` enables mixed-precision training on CUDA (most of the compute
-    happens in float16 instead of float32) — a genuine compute speedup on
+    happens in float16 instead of float32) -- a genuine compute speedup on
     GPUs with Tensor Cores, not just a data-pipeline fix like the two above.
-    It's automatically a no-op on CPU regardless of this flag. Loss is
-    BCEWithLogitsLoss on the model's raw logits rather than sigmoid output +
-    BCELoss — the latter is both disallowed under autocast and can trip a
-    hard CUDA assertion if fp16 rounding pushes a sigmoid output outside
-    [0, 1]. ``grad_clip_norm`` bounds gradient norms as an extra guard
-    against the instability that error was a symptom of.
+    It's automatically a no-op on CPU regardless of this flag.
+    ``grad_clip_norm`` bounds gradient norms as a general training-stability
+    guard.
 
     ``checkpoint_path``, if given, saves the model after every epoch (not
-    just at the end) — a crash partway through a long run then loses at most
+    just at the end) -- a crash partway through a long run then loses at most
     one epoch's progress instead of all of it.
     """
     torch.backends.cudnn.benchmark = True
@@ -358,7 +507,7 @@ def train(
         persistent_workers=num_workers > 0,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler(device_type, enabled=amp_enabled)
     num_batches = len(loader)
 
@@ -370,7 +519,7 @@ def train(
             targets = targets.to(device, non_blocking=True)
             optimizer.zero_grad()
             with torch.amp.autocast(device_type, enabled=amp_enabled):
-                logits = model.forward_logits(frames)
+                logits = model(frames)  # (batch, 256, H*W); testing=False (default) -> raw logits
                 loss = loss_fn(logits, targets)
             scaler.scale(loss).backward()
             if grad_clip_norm is not None:
@@ -397,12 +546,22 @@ def print_training_progress(epoch: int, batch_index: int, num_batches: int, batc
 
 
 def save_model(model: TrackNet, path: str | Path) -> None:
-    torch.save({"num_frames": model.num_frames, "state_dict": model.state_dict()}, path)
+    torch.save(
+        {"architecture": ARCHITECTURE_VERSION, "input_size": model.input_size, "state_dict": model.state_dict()},
+        path,
+    )
 
 
 def load_model(path: str | Path, device: str = "cpu") -> TrackNet:
     checkpoint = torch.load(path, map_location=device, weights_only=True)
-    model = TrackNet(num_frames=checkpoint["num_frames"])
+    if not isinstance(checkpoint, dict) or checkpoint.get("architecture") != ARCHITECTURE_VERSION:
+        raise RuntimeError(
+            f"{path} isn't a checkpoint for this TrackNet architecture ({ARCHITECTURE_VERSION!r}). This module "
+            "was rewritten to port yastrebksv/TrackNet, which is not a compatible extension of the previous "
+            "version -- checkpoints trained before this change must be retrained with the current "
+            "'tracknet.py train' command."
+        )
+    model = TrackNet(input_size=tuple(checkpoint["input_size"]))
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device)
     model.eval()
@@ -412,20 +571,31 @@ def load_model(path: str | Path, device: str = "cpu") -> TrackNet:
 def run_tracknet_on_video(
     video_path: str | Path,
     model: TrackNet,
-    input_size: tuple[int, int] = DEFAULT_INPUT_SIZE,
-    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    input_size: tuple[int, int] | None = None,
     device: str = "cpu",
     verbose: bool = False,
+    binary_threshold: int = DEFAULT_BINARY_THRESHOLD,
+    hough_param1: float = DEFAULT_HOUGH_PARAM1,
+    hough_param2: float = DEFAULT_HOUGH_PARAM2,
+    min_radius: int = DEFAULT_MIN_RADIUS,
+    max_radius: int = DEFAULT_MAX_RADIUS,
 ):
     """Yield a BallDetection per frame of ``video_path`` using a trained TrackNet model.
 
-    Same per-frame generator contract as tennis_tracker.ball.detect_video —
+    Same per-frame generator contract as tennis_tracker.ball.detect_video --
     this is meant as a drop-in alternative once a model is actually trained.
-    The first (num_frames - 1) frames yield position=None (not enough
+    The first (NUM_FRAMES - 1) frames yield position=None (not enough
     temporal context yet), matching detect_video's "not found" convention.
+
+    ``input_size`` defaults to whatever resolution ``model`` was trained at
+    (round-tripped through save_model/load_model) -- passing a different
+    value here than training used would silently change how large the ball
+    appears to the network relative to what it learned, so leave this unset
+    unless you have a specific reason to override it.
     """
     model.eval()
     model.to(device)
+    input_size = input_size or model.input_size
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -439,7 +609,7 @@ def run_tracknet_on_video(
     scale_x = orig_width / width
     scale_y = orig_height / height
 
-    buffer: deque = deque(maxlen=model.num_frames)
+    buffer: deque = deque(maxlen=NUM_FRAMES)
     frame_index = 0
     try:
         with torch.no_grad():
@@ -448,24 +618,26 @@ def run_tracknet_on_video(
                 if not ok:
                     break
 
-                resized = cv2.resize(frame, (width, height))
-                rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-                buffer.append(rgb.transpose(2, 0, 1))
+                buffer.append(cv2.resize(frame, (width, height)))
 
-                if len(buffer) < model.num_frames:
-                    position = None
+                if len(buffer) < NUM_FRAMES:
+                    position, radius = None, None
                 else:
-                    stacked = np.concatenate(list(buffer), axis=0)
+                    newest_first = list(buffer)[::-1]  # [current, prev, preprev]
+                    stacked = np.concatenate(newest_first, axis=2).astype(np.float32) / 255.0
+                    stacked = np.rollaxis(stacked, 2, 0)
                     tensor = torch.from_numpy(stacked).unsqueeze(0).to(device)
-                    heatmaps = model(tensor)[0].cpu().numpy()
-                    last_heatmap = heatmaps[-1]  # freshest frame's prediction
-                    if float(last_heatmap.max()) < confidence_threshold:
-                        position = None
-                    else:
-                        hx, hy = heatmap_to_position(last_heatmap)
-                        position = (hx * scale_x, hy * scale_y)
+                    logits = model(tensor)[0].cpu().numpy()  # (256, H*W)
+                    class_map = logits.argmax(axis=0).reshape(height, width)
+                    position, radius = postprocess_heatmap(
+                        class_map, scale_x, scale_y,
+                        binary_threshold=binary_threshold, hough_param1=hough_param1, hough_param2=hough_param2,
+                        min_radius=min_radius, max_radius=max_radius,
+                    )
 
-                yield BallDetection(frame_index=frame_index, timestamp=frame_index / fps, position=position)
+                yield BallDetection(
+                    frame_index=frame_index, timestamp=frame_index / fps, position=position, radius=radius,
+                )
                 frame_index += 1
                 if verbose and (frame_index % 30 == 0 or frame_index == total_frames):
                     print(f"\rball detection: frame {frame_index}/{total_frames or '?'}", end="", flush=True)
@@ -480,8 +652,13 @@ def visualize(
     output_path: str | Path,
     model: TrackNet,
     trail_length: int = 15,
-    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+    input_size: tuple[int, int] | None = None,
     device: str = "cpu",
+    binary_threshold: int = DEFAULT_BINARY_THRESHOLD,
+    hough_param1: float = DEFAULT_HOUGH_PARAM1,
+    hough_param2: float = DEFAULT_HOUGH_PARAM2,
+    min_radius: int = DEFAULT_MIN_RADIUS,
+    max_radius: int = DEFAULT_MAX_RADIUS,
 ) -> int:
     """Write an annotated copy of ``video_path`` with the TrackNet-detected ball + trail overlaid."""
     cap = cv2.VideoCapture(str(video_path))
@@ -501,7 +678,9 @@ def visualize(
     frame_count = 0
     try:
         for detection in run_tracknet_on_video(
-            video_path, model, confidence_threshold=confidence_threshold, device=device
+            video_path, model, input_size=input_size, device=device,
+            binary_threshold=binary_threshold, hough_param1=hough_param1, hough_param2=hough_param2,
+            min_radius=min_radius, max_radius=max_radius,
         ):
             ok, frame = cap.read()
             if not ok:
@@ -528,7 +707,7 @@ def visualize(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Phase E: TrackNet-style ball detector.")
+    parser = argparse.ArgumentParser(description="Phase E: TrackNet-style ball detector (ported from yastrebksv/TrackNet).")
     sub = parser.add_subparsers(dest="command", required=True)
 
     train_p = sub.add_parser("train", help="Train on the TrackNet dataset (game*/Clip*/*.jpg + Label.csv).")
@@ -536,7 +715,6 @@ def main(argv: list[str] | None = None) -> int:
     train_p.add_argument("--output", required=True, help="Path to save the trained model checkpoint.")
     train_p.add_argument("--games", default=None, help='Comma-separated game numbers, e.g. "1,2,3". Default: all.')
     train_p.add_argument("--max-clips-per-game", type=int, default=None, help="Cap clips per game (quick smoke run).")
-    train_p.add_argument("--num-frames", type=int, default=DEFAULT_NUM_FRAMES)
     train_p.add_argument("--epochs", type=int, default=10)
     train_p.add_argument("--batch-size", type=int, default=2)
     train_p.add_argument("--lr", type=float, default=1e-3)
@@ -547,12 +725,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     train_p.add_argument(
         "--input-width", type=int, default=DEFAULT_INPUT_SIZE[0],
-        help="Resize frames to this width before feeding the network. Smaller = faster, less precise.",
+        help="Resize frames to this width before feeding the network (must be divisible by 8). Smaller = faster, "
+        "less VRAM, less precise. Saved into the checkpoint, so visualize/inference automatically match -- no "
+        "need to pass this again later.",
     )
     train_p.add_argument(
         "--input-height", type=int, default=DEFAULT_INPUT_SIZE[1],
-        help="Resize frames to this height before feeding the network. Smaller = faster, less precise.",
+        help="Resize frames to this height before feeding the network (must be divisible by 8).",
     )
+    train_p.add_argument("--gaussian-kernel-size", type=int, default=DEFAULT_GAUSSIAN_KERNEL_SIZE)
+    train_p.add_argument("--gaussian-variance", type=float, default=DEFAULT_GAUSSIAN_VARIANCE)
     train_p.add_argument(
         "--no-amp", action="store_true",
         help="Disable mixed-precision (fp16) training. On by default on CUDA; harmless to leave on.",
@@ -562,8 +744,20 @@ def main(argv: list[str] | None = None) -> int:
     viz_p.add_argument("video")
     viz_p.add_argument("output_video")
     viz_p.add_argument("--model", required=True, help="Trained model checkpoint from 'train'.")
-    viz_p.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
-    viz_p.add_argument("--device", default="cpu", help='"cpu" or "cuda" — GPU inference is much faster.')
+    viz_p.add_argument("--device", default="cpu", help='"cpu" or "cuda" -- GPU inference is much faster.')
+    viz_p.add_argument(
+        "--input-width", type=int, default=None,
+        help="Override the resolution baked into the checkpoint at training time. Leave unset to use that.",
+    )
+    viz_p.add_argument("--input-height", type=int, default=None)
+    viz_p.add_argument("--binary-threshold", type=int, default=DEFAULT_BINARY_THRESHOLD)
+    viz_p.add_argument("--hough-param1", type=float, default=DEFAULT_HOUGH_PARAM1)
+    viz_p.add_argument(
+        "--hough-param2", type=float, default=DEFAULT_HOUGH_PARAM2,
+        help="Lower = more permissive circle detection (more false positives); higher = stricter.",
+    )
+    viz_p.add_argument("--min-radius", type=int, default=DEFAULT_MIN_RADIUS)
+    viz_p.add_argument("--max-radius", type=int, default=DEFAULT_MAX_RADIUS)
 
     args = parser.parse_args(argv)
 
@@ -571,11 +765,11 @@ def main(argv: list[str] | None = None) -> int:
         games = [int(g) for g in args.games.split(",")] if args.games else None
         input_size = (args.input_width, args.input_height)
         dataset = build_dataset_from_root(
-            args.dataset_root, games=games, max_clips_per_game=args.max_clips_per_game,
-            num_frames=args.num_frames, input_size=input_size,
+            args.dataset_root, games=games, max_clips_per_game=args.max_clips_per_game, input_size=input_size,
+            gaussian_kernel_size=args.gaussian_kernel_size, gaussian_variance=args.gaussian_variance,
         )
         print(f"Training on {len(dataset)} windows from {args.dataset_root} at {input_size[0]}x{input_size[1]}")
-        model = TrackNet(num_frames=args.num_frames)
+        model = TrackNet(input_size=input_size)
         history = train(
             model, dataset, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=args.device,
             num_workers=args.num_workers, use_amp=not args.no_amp, checkpoint_path=args.output,
@@ -586,9 +780,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "visualize":
         model = load_model(args.model, device=args.device)
+        input_size = (args.input_width, args.input_height) if args.input_width and args.input_height else None
         count = visualize(
-            args.video, args.output_video, model,
-            confidence_threshold=args.confidence_threshold, device=args.device,
+            args.video, args.output_video, model, input_size=input_size, device=args.device,
+            binary_threshold=args.binary_threshold, hough_param1=args.hough_param1, hough_param2=args.hough_param2,
+            min_radius=args.min_radius, max_radius=args.max_radius,
         )
         print(f"Wrote {count} annotated frames to {args.output_video}")
         return 0
