@@ -568,6 +568,55 @@ def load_model(path: str | Path, device: str = "cpu") -> TrackNet:
     return model
 
 
+# The resolution yastrebksv/TrackNet's own released weights were trained
+# and tuned at (its README/scripts hardcode 640x360 throughout) -- import
+# at anything else and the Hough-circle postprocessing parameters, tuned
+# for the ball's apparent size at that scale, would be wrong for it.
+PRETRAINED_INPUT_SIZE = (640, 360)
+
+
+def import_pretrained_checkpoint(
+    raw_checkpoint_path: str | Path,
+    output_path: str | Path,
+    input_size: tuple[int, int] = PRETRAINED_INPUT_SIZE,
+    device: str = "cpu",
+) -> None:
+    """Wrap yastrebksv/TrackNet's own released checkpoint for use with this module.
+
+    Their checkpoint (e.g. the "Pretrained model" linked from
+    https://github.com/yastrebksv/TrackNet's README) is a bare
+    ``model.state_dict()``, not wrapped with an architecture tag or the
+    training resolution the way save_model() does here. This module's
+    TrackNet uses the exact same layer names/structure as their
+    BallTrackerNet (ConvBlock order, conv1..conv18, pool1..pool3,
+    ups1..ups3), so the weights load directly -- this just adds the
+    wrapping so it plugs into load_model()/get_ball_detections() like any
+    checkpoint trained with this module's own train().
+
+    ``weights_only=True`` (used here, as everywhere else this module loads
+    a checkpoint) restricts unpickling to plain tensor data, blocking the
+    classic arbitrary-code-execution vector in a malicious pickle -- the
+    supply-chain risk ball.py's docstring flags with loading third-party
+    model weights. It doesn't certify the weights are trustworthy or
+    correct, just that loading them can't execute arbitrary code.
+
+    Raises a RuntimeError with the mismatched key names if the checkpoint's
+    state_dict doesn't line up with this module's TrackNet layer-for-layer
+    (e.g. if it's actually a different release/architecture than expected).
+    """
+    raw_state_dict = torch.load(raw_checkpoint_path, map_location=device, weights_only=True)
+    model = TrackNet(input_size=input_size)
+    try:
+        model.load_state_dict(raw_state_dict)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"{raw_checkpoint_path}'s state_dict doesn't match this module's TrackNet layer-for-layer "
+            f"(see error below) -- is this really yastrebksv/TrackNet's released state_dict, not some other "
+            f"checkpoint format?\n\n{e}"
+        ) from e
+    save_model(model, output_path)
+
+
 def run_tracknet_on_video(
     video_path: str | Path,
     model: TrackNet,
@@ -759,6 +808,20 @@ def main(argv: list[str] | None = None) -> int:
     viz_p.add_argument("--min-radius", type=int, default=DEFAULT_MIN_RADIUS)
     viz_p.add_argument("--max-radius", type=int, default=DEFAULT_MAX_RADIUS)
 
+    import_p = sub.add_parser(
+        "import-pretrained",
+        help="Wrap yastrebksv/TrackNet's own released checkpoint (e.g. their 'Pretrained model' Google Drive "
+        "link) for use with this module -- no training required.",
+    )
+    import_p.add_argument("raw_checkpoint", help="Path to the downloaded raw state_dict checkpoint.")
+    import_p.add_argument("--output", required=True, help="Path to save the wrapped checkpoint to.")
+    import_p.add_argument(
+        "--input-width", type=int, default=PRETRAINED_INPUT_SIZE[0],
+        help="Resolution their release was trained/tuned at -- change only if you know it differs.",
+    )
+    import_p.add_argument("--input-height", type=int, default=PRETRAINED_INPUT_SIZE[1])
+    import_p.add_argument("--device", default="cpu")
+
     args = parser.parse_args(argv)
 
     if args.command == "train":
@@ -787,6 +850,12 @@ def main(argv: list[str] | None = None) -> int:
             min_radius=args.min_radius, max_radius=args.max_radius,
         )
         print(f"Wrote {count} annotated frames to {args.output_video}")
+        return 0
+
+    if args.command == "import-pretrained":
+        input_size = (args.input_width, args.input_height)
+        import_pretrained_checkpoint(args.raw_checkpoint, args.output, input_size=input_size, device=args.device)
+        print(f"Saved {args.output}, ready to use with --tracknet-model {args.output}")
         return 0
 
     return 1

@@ -15,6 +15,7 @@ from tennis_tracker.tracknet import (  # noqa: E402
     build_dataset_from_root,
     find_clip_directories,
     generate_heatmap_classes,
+    import_pretrained_checkpoint,
     load_label_csv,
     load_model,
     postprocess_heatmap,
@@ -269,3 +270,31 @@ def test_run_tracknet_on_video_yields_one_detection_per_frame(tmp_path):
     assert detections[1].position is None
     for d in detections:
         assert d.frame_index in range(6)
+
+
+def test_import_pretrained_checkpoint_wraps_a_bare_state_dict(tmp_path):
+    # Stand-in for yastrebksv/TrackNet's own released checkpoint, which is
+    # just a bare state_dict (no architecture tag or input_size) -- since
+    # this module's TrackNet mirrors their BallTrackerNet's layer names
+    # exactly, our own model's state_dict works as a same-shape stand-in to
+    # test the wrapping/loading logic without needing their actual weights.
+    source_model = TrackNet(input_size=(64, 48))
+    raw_path = tmp_path / "raw_state_dict.pt"
+    torch.save(source_model.state_dict(), raw_path)
+
+    output_path = tmp_path / "wrapped.pt"
+    import_pretrained_checkpoint(raw_path, output_path, input_size=(64, 48))
+
+    loaded = load_model(output_path)
+    assert loaded.input_size == (64, 48)
+    x = torch.rand(1, NUM_FRAMES * 3, 48, 64)
+    with torch.no_grad():
+        torch.testing.assert_close(source_model.eval()(x), loaded(x))
+
+
+def test_import_pretrained_checkpoint_reports_key_mismatch_clearly(tmp_path):
+    raw_path = tmp_path / "mismatched.pt"
+    torch.save({"totally_unrelated_key": torch.zeros(3)}, raw_path)
+
+    with pytest.raises(RuntimeError, match="doesn't match"):
+        import_pretrained_checkpoint(raw_path, tmp_path / "out.pt")
